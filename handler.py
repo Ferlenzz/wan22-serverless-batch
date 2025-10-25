@@ -4,13 +4,15 @@ import runpod
 
 from engine import generate_one
 
-RATE_USD_PER_SEC = float(os.environ.get('COST_RATE_USD_PER_SEC', '0.00031'))  # rough estimate
+# приблизительная ставка $/сек (скорость биллинга на serverless)
+RATE_USD_PER_SEC = float(os.environ.get('COST_RATE_USD_PER_SEC', '0.00031'))
 
 def handler(event):
-    """RunPod Serverless handler.
-    Expected event['input']:
+    """
+    Ожидаемый input:
       action: 'health' | 'run'
-      prompt, image_base64, width, height, steps, cfg, length
+      prompt, image_base64, width, height, steps, cfg, length,
+      use_last (bool), user_id (str)
     """
     inp = (event or {}).get('input') or {}
     action = (inp.get('action') or 'run').lower()
@@ -18,7 +20,6 @@ def handler(event):
     if action == 'health':
         return {'ok': True, 'status': 'ready'}
 
-    # default path: run generation
     t0 = time.time()
     res = generate_one(inp)
     exec_secs = time.time() - t0
@@ -32,6 +33,7 @@ def handler(event):
         'video': res['video_b64'],
         'seconds': res['seconds'],
         'saved_path': res['path'],
+        'last_image_path': res.get('last_image_path'),
         'estimated_cost_usd': round(cost, 6),
     }
     logger.info("Done in {}s, saved {}", res['seconds'], res['path'])
