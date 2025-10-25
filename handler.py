@@ -1,5 +1,11 @@
 import os, runpod, base64
-from engine import generate_one, _start_comfy_once
+from engine import generate_one
+try:
+    from engine import _start_comfy_once  # если когда-нибудь вернёшь Comfy
+except ImportError:
+    def _start_comfy_once(*args, **kwargs):
+        return None
+
 
 RATE_PER_SEC = float(os.environ.get("RATE_PER_SEC", "0.00031"))  # пример для оценки
 
