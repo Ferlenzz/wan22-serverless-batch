@@ -1,0 +1,19 @@
+{
+  "tests": [
+    {
+      "name": "health",
+      "input": {"action":"health"},
+      "timeout": 20000
+    },
+    {
+      "name": "warmup",
+      "input": {"action":"warmup"},
+      "timeout": 60000
+    },
+    {
+      "name": "runsync minimal",
+      "input": {"action":"runsync","prompt":"quick test","width":480,"height":832,"steps":4,"length":16},
+      "timeout": 600000
+    }
+  ]
+}
