@@ -1,4 +1,0 @@
-{
-  "__note__": "СЮДА ПОЛОЖИ СВОЙ РАБОЧИЙ new_Wan22_api.json (ComfyUI). Этот файл — просто заглушка.",
-  "info": "Убедись, что в нодах есть поля: prompt, width, height, steps, cfg, length, image_base64, model_dir, vae_path"
-}
