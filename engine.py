@@ -1,166 +1,111 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Native-style engine for RunPod serverless worker.
-See docstring inside for details.
-"""
-import base64, binascii, io, os, shutil, subprocess, time, uuid
-from dataclasses import dataclass
-from typing import Optional, Tuple
+import base64, io, os, time
+from typing import Dict, Any, List
+
 from PIL import Image
+import numpy as np
+import imageio.v2 as imageio
+import torch
 
-RP_VOLUME   = os.environ.get("RP_VOLUME", "/runpod-volume")
-STATE_DIR   = os.path.join(RP_VOLUME, "state")
-LAST_DIR    = os.path.join(STATE_DIR, "last_images")
-RESULTS_DIR = os.path.join(RP_VOLUME, "results")
-TMP_DIR     = os.path.join(RP_VOLUME, "tmp")
+from loguru import logger
 
-WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/runpod-volume/models/Wan2.2-TI2V-5B")
-WAN_VAE_PATH = os.environ.get("WAN_VAE_PATH", "/runpod-volume/models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth")
+import sys
+sys.path.append('/app/Wan2.2')
+from wan.configs.wan_ti2v_5B import ti2v_5B as cfg_fn
+from wan.image2video import WanI2V
 
-os.makedirs(LAST_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
-os.makedirs(TMP_DIR, exist_ok=True)
+CKPT_DIR = os.environ.get('WAN_CKPT_DIR', '/runpod-volume/models/Wan2.2-TI2V-5B')
+RP_VOLUME = os.environ.get('RP_VOLUME', '/runpod-volume')
 
-@dataclass
-class GenParams:
-    prompt: str
-    width: int
-    height: int
-    steps: int
-    cfg: float
-    length: int
-    user_id: str
-    image_b64: Optional[str] = None
-    use_last: bool = False
-    return_video_b64: bool = True
+_MODEL = None
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
+def _init_model() -> WanI2V:
+    global _MODEL
+    if _MODEL is not None:
+        return _MODEL
+    cfg = cfg_fn()
 
-def _b64_to_pil(img_b64: str) -> Image.Image:
-    if img_b64.startswith("data:image"):
-        _, b64 = img_b64.split(",", 1)
-    else:
-        b64 = img_b64
-    raw = base64.b64decode(b64)
-    return Image.open(io.BytesIO(raw)).convert("RGB")
+    if not hasattr(cfg, 'boundary'):
+        cfg.boundary = 500
+    _MODEL = WanI2V(cfg, CKPT_DIR, device_id=0)
+    logger.info("WanI2V initialized with checkpoints at {}", CKPT_DIR)
+    return _MODEL
 
-def _encode_video_to_b64(mp4_path: str) -> str:
-    with open(mp4_path, "rb") as f:
-        raw = f.read()
-    return "data:video/mp4;base64," + base64.b64encode(raw).decode("utf-8")
+def _b64_to_pil(b64: str) -> Image.Image:
+    if b64.startswith('data:'):
+        b64 = b64.split(',', 1)[1]
+    data = base64.b64decode(b64)
+    return Image.open(io.BytesIO(data)).convert('RGB')
 
-def _save_last_image(user_id: str, img: Image.Image) -> str:
-    path = os.path.join(LAST_DIR, f"{user_id}.png")
-    img.save(path, format="PNG")
-    return path
+def _frames_to_mp4(frames: List[np.ndarray], fps: int = 24) -> bytes:
+    buf = io.BytesIO()
+    imageio.mimwrite(buf, frames, format='ffmpeg', fps=fps, codec='libx264', quality=8)
+    return buf.getvalue()
 
-def _load_last_image(user_id: str) -> Optional[Image.Image]:
-    path = os.path.join(LAST_DIR, f"{user_id}.png")
-    if os.path.exists(path):
-        try:
-            return Image.open(path).convert("RGB")
-        except Exception:
-            return None
-    return None
+def _to_numpy_frames(v) -> List[np.ndarray]:
+    if isinstance(v, list):
+        return [np.array(img) for img in v]
+    if isinstance(v, torch.Tensor):
+        x = v.detach().cpu()
+        if x.max() <= 1.0:
+            x = x * 255.0
+        x = x.clamp(0, 255).byte()
+        if x.dim() == 4:
+            x = x.permute(0, 2, 3, 1).contiguous()
+        return [f.numpy() for f in x]
+    raise TypeError(f"Unsupported video type: {type(v)}")
 
-def run_wan_native(model_dir: str, vae_path: str, prompt: str,
-                   ref_image_path: str, width: int, height: int,
-                   steps: int, cfg: float, length: int, out_mp4: str) -> None:
+def generate_one(slots: Dict[str, Any]) -> Dict[str, Any]:
+    """Main generation routine used by handler.
+    slots keys:
+      - prompt: str
+      - image_base64: str
+      - length: int (frames), default 81
+      - steps: int, default 40
+      - cfg: float, default 5.0
+      - width,height (optional): only used to compute max_area (defaults 1280x720)
+    returns dict: { ok: bool, video_b64: str, seconds: float, path: str }
     """
-    TODO: ВСТАВЬ реальный вызов WAN 2.2 (Python API или CLI) здесь.
-    Примеры и подсказки в README_WORKFLOW.md в репозитории.
-    Сейчас — осознанный raise, чтобы не молча "успешно" ничего не делать.
-    """
-    raise FileNotFoundError(
-        "Вставьте ваш реальный вызов WAN 2.2 в run_wan_native(...). "
-        f"Модель: {model_dir}, VAE: {vae_path}"
+    m = _init_model()
+
+    prompt = slots.get('prompt') or ''
+    image_b64 = slots.get('image_base64')
+    if not image_b64:
+        return {'ok': False, 'error': 'image_base64 is required'}
+
+    img = _b64_to_pil(image_b64)
+
+    width = int(slots.get('width', 1280))
+    height = int(slots.get('height', 720))
+    max_area = width * height
+
+    frame_num = int(slots.get('length', 81))
+    steps = int(slots.get('steps', 40))
+    guide_scale = float(slots.get('cfg', 5.0))
+
+    t0 = time.time()
+    video = m.generate(
+        input_prompt=prompt,
+        img=img,
+        frame_num=frame_num,
+        sampling_steps=steps,
+        guide_scale=guide_scale,
+        max_area=max_area,
+        offload_model=True,
     )
+    frames = _to_numpy_frames(video)
+    mp4_bytes = _frames_to_mp4(frames, fps=24)
+    import base64 as _b64
+    b64 = _b64.b64encode(mp4_bytes).decode('utf-8')
+    secs = time.time() - t0
 
-def generate_one(params: GenParams, job_id: Optional[str] = None) -> Tuple[str, Optional[str]]:
-    if job_id is None:
-        job_id = str(uuid.uuid4())
+    os.makedirs(f"{RP_VOLUME}/results", exist_ok=True)
+    out_path = os.path.join(RP_VOLUME, 'results', f'wan22_{int(time.time())}.mp4')
+    with open(out_path, 'wb') as f:
+        f.write(mp4_bytes)
 
-    start_ms = _now_ms()
-    src_img: Optional[Image.Image] = None
-
-    if params.image_b64:
-        try:
-            src_img = _b64_to_pil(params.image_b64)
-        except binascii.Error:
-            src_img = None
-
-    if src_img is None and params.use_last:
-        src_img = _load_last_image(params.user_id)
-
-    if src_img is None:
-        src_img = Image.new("RGB", (params.width, params.height), (255, 255, 255))
-
-    _save_last_image(params.user_id, src_img)
-
-    work_dir = os.path.join(TMP_DIR, job_id)
-    os.makedirs(work_dir, exist_ok=True)
-    ref_png_path = os.path.join(work_dir, "ref.png")
-    src_img.save(ref_png_path, format="PNG")
-
-    out_mp4_path = os.path.join(RESULTS_DIR, f"{job_id}.mp4")
-
-    run_wan_native(
-        model_dir=WAN_CKPT_DIR,
-        vae_path=WAN_VAE_PATH,
-        prompt=params.prompt,
-        ref_image_path=ref_png_path,
-        width=params.width,
-        height=params.height,
-        steps=params.steps,
-        cfg=params.cfg,
-        length=params.length,
-        out_mp4=out_mp4_path,
-    )
-
-    video_b64 = _encode_video_to_b64(out_mp4_path) if params.return_video_b64 else None
-    try:
-        shutil.rmtree(work_dir, ignore_errors=True)
-    except Exception:
-        pass
-
-    exec_ms = _now_ms() - start_ms
-    return out_mp4_path, video_b64
-
-def generate(payload: dict) -> dict:
-    t0 = _now_ms()
-    action = str(payload.get("action", "gen"))
-
-    if action == "warmup":
-        return {
-            "ok": True,
-            "model_dir": WAN_CKPT_DIR,
-            "vae_path": WAN_VAE_PATH,
-            "model_exists": os.path.exists(WAN_CKPT_DIR),
-            "vae_exists": os.path.exists(WAN_VAE_PATH),
-            "executionTime": _now_ms() - t0,
-        }
-
-    params = GenParams(
-        prompt=str(payload.get("prompt", "a cinematic shot")),
-        width=int(payload.get("width", 480)),
-        height=int(payload.get("height", 832)),
-        steps=int(payload.get("steps", 10)),
-        cfg=float(payload.get("cfg", 2.0)),
-        length=int(payload.get("length", 81)),
-        user_id=str(payload.get("user_id", "u1")),
-        image_b64=payload.get("image_base64"),
-        use_last=bool(payload.get("use_last", False)),
-        return_video_b64=bool(payload.get("return_video_b64", True)),
-    )
-
-    job_id = str(uuid.uuid4())
-    try:
-        mp4_path, b64 = generate_one(params, job_id=job_id)
-        out = {"ok": True, "job_id": job_id, "mp4_path": mp4_path, "executionTime": _now_ms() - t0}
-        if b64:
-            out["video"] = b64
-        return out
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}", "executionTime": _now_ms() - t0}
+    return {
+        'ok': True,
+        'video_b64': 'data:video/mp4;base64,' + b64,
+        'seconds': round(secs, 3),
+        'path': out_path,
+    }
