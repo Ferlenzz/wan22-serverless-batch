@@ -1,83 +1,134 @@
-import os, json, base64, subprocess, tempfile, shutil
+import os, json, time, base64, subprocess, requests
 from pathlib import Path
-from typing import List, Dict
+from typing import Optional, Tuple
 
-TMP_ROOT = Path(os.environ.get("TMPDIR","/tmp"))
-TMP_ROOT.mkdir(parents=True, exist_ok=True)
+RP_VOLUME      = os.environ.get("RP_VOLUME", "/runpod-volume")
+WAN_DIR        = os.environ.get("WAN_CKPT_DIR", "/runpod-volume/models/Wan2.2-TI2V-5B")
+WAN_VAE        = os.environ.get("WAN_VAE_PATH", f"{WAN_DIR}/Wan2.2_VAE.pth")
+WORKFLOW_JSON  = os.environ.get("WORKFLOW_JSON", "/runpod-volume/workflows/new_Wan22_api.json")
 
-def _b64_video(path: Path) -> str:
-    raw = path.read_bytes()
-    return "data:video/mp4;base64," + base64.b64encode(raw).decode()
+COMFY_DIR      = "/app/ComfyUI"
+COMFY_API      = "http://127.0.0.1:8188"
 
-def _extract_last_frame(video_path: Path, out_png: Path):
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["ffmpeg","-y","-i",str(video_path),"-vf","select=eq(n\\,last)","-vframes","1",str(out_png)]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+LAST_DIR       = Path(RP_VOLUME) / "state" / "last_images"
+RESULTS_DIR    = Path(RP_VOLUME) / "results"
+OUTPUT_DIR     = Path(COMFY_DIR) / "output"
 
-class _Engine:
-    def __init__(self):
-        # TODO: разовая инициализация WAN 2.2 / Comfy графа
+LAST_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+_comfy_started = False
+
+def _start_comfy_once():
+    global _comfy_started
+    if _comfy_started:
+        return
+    try:
+        requests.get(COMFY_API, timeout=0.3)
+        _comfy_started = True
+        return
+    except Exception:
         pass
 
-    # ---- ВСТАВЬ СВОЙ РЕАЛЬНЫЙ ВЫЗОВ WAN 2.2 ЗДЕСЬ ----
-    def _run_wan22_one(self, job: Dict, tmp_dir: Path) -> Path:
-        """
-        Сгенерируй видео и верни путь к mp4 в tmp_dir.
-        Здесь — заглушка через ffmpeg (крутит 1 кадр), замени на свой вызов.
-        """
-        vid = tmp_dir / "vid.mp4"
-        png = tmp_dir / "f.png"
-        # если клиент передал исходное изображение
-        img_b64 = (job.get("image_base64") or "")
-        if "," in img_b64: img_b64 = img_b64.split(",",1)[1]
-        if img_b64:
-            png.write_bytes(base64.b64decode(img_b64))
-        else:
-            from PIL import Image
-            w=int(job.get("width",480)); h=int(job.get("height",832))
-            Image.new("RGB",(w,h),(10,10,10)).save(png)
-        # NVENC-кодек для скорости/цены
-        cmd = ["ffmpeg","-y","-loop","1","-i",str(png),"-t","1.0","-r","8",
-               "-c:v","h264_nvenc","-preset","p4","-qp","23", str(vid)]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return vid
-    # ----------------------------------------------------
+    subprocess.Popen(
+        ["python3", "main.py", "--listen", "127.0.0.1", "--port", "8188", "--no-gpu-check"],
+        cwd=COMFY_DIR,
+        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+    )
+    for _ in range(60):
+        try:
+            requests.get(COMFY_API, timeout=0.5)
+            _comfy_started = True
+            break
+        except Exception:
+            time.sleep(0.5)
+    if not _comfy_started:
+        raise RuntimeError("ComfyUI API not reachable")
 
-    def process_batch(self, batch: List[Dict], results_dir: Path, last_dir: Path) -> List[Dict]:
-        out=[]
-        results_dir.mkdir(parents=True, exist_ok=True)
-        last_dir.mkdir(parents=True, exist_ok=True)
+def _b64_of_image_path(p: Path) -> str:
+    with open(p, "rb") as f:
+        return "data:image/png;base64," + base64.b64encode(f.read()).decode()
 
-        for job in batch:
-            jid = job["job_id"]; uid = job.get("user_id","u1")
-            tmp = TMP_ROOT / f"wan22_{jid}"
-            shutil.rmtree(tmp, ignore_errors=True)
-            tmp.mkdir(parents=True, exist_ok=True)
-            try:
-                vid = self._run_wan22_one(job, tmp)
+def _choose_input_image(user_id: str, image_base64: Optional[str], use_last: bool) -> Optional[str]:
+    if image_base64:
+        return image_base64
+    if use_last:
+        p = LAST_DIR / f"{user_id}.png"
+        if p.exists():
+            return _b64_of_image_path(p)
+    return None
 
-                # last frame
-                last_png = last_dir / f"{uid}.png"
-                try: _extract_last_frame(vid, last_png)
-                except Exception: pass
+def _set_input(workflow: dict, **slots):
+    def visit(d):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                if isinstance(v, (dict, list)):
+                    visit(v)
+                else:
+                    if k in slots and slots[k] is not None:
+                        d[k] = slots[k]
+        elif isinstance(d, list):
+            for it in d: visit(it)
+    visit(workflow)
+    return workflow
 
-                final = results_dir / f"{jid}.mp4"
-                shutil.move(str(vid), final)
+def generate_one(
+    prompt: str,
+    width: int,
+    height: int,
+    steps: int,
+    cfg: float,
+    length: int,
+    user_id: str = "u1",
+    use_last: bool = True,
+    image_base64: Optional[str] = None,
+    return_base64: bool = False
+) -> dict:
+    """Генерация одного видео через ComfyUI/Wan2.2.
+    Возвращает { ok, mp4_path, video_base64?, exec_ms }.
+    """
+    t0 = time.time()
+    _start_comfy_once()
 
-                payload = {
-                    "status": "COMPLETED",
-                    "job_id": jid,
-                    "video_path": str(final),
-                    # "video_base64": _b64_video(final),  # включай только для runsync, иначе трафик
-                }
-                (results_dir / f"{jid}.json").write_text(json.dumps(payload, ensure_ascii=False))
-                out.append(payload)
-            except Exception as e:
-                payload = {"status":"FAILED","job_id":jid,"error":str(e)}
-                (results_dir / f"{jid}.json").write_text(json.dumps(payload, ensure_ascii=False))
-                out.append(payload)
-            finally:
-                shutil.rmtree(tmp, ignore_errors=True)
-        return out
+    img_b64 = _choose_input_image(user_id, image_base64, use_last)
+    if not os.path.exists(WORKFLOW_JSON):
+        raise FileNotFoundError(f"Workflow JSON not found: {WORKFLOW_JSON}")
 
-ENGINE = _Engine()
+    with open(WORKFLOW_JSON, "r", encoding="utf-8") as f:
+        wf = json.load(f)
+
+    slots = dict(
+        prompt=prompt,
+        width=width, height=height, steps=steps, cfg=cfg, length=length,
+        image_base64=img_b64,
+        model_dir=WAN_DIR,
+        vae_path=WAN_VAE,
+    )
+    wf = _set_input(wf, **slots)
+
+    r = requests.post(f"{COMFY_API}/prompt", json=wf, timeout=60)
+    r.raise_for_status()
+    # ждём появления нового mp4 в output/
+    seen = set(p.name for p in OUTPUT_DIR.glob("*.mp4"))
+    result_mp4 = None
+    for _ in range(1200):
+        for p in OUTPUT_DIR.glob("*.mp4"):
+            if p.name not in seen:
+                result_mp4 = p
+                break
+        if result_mp4:
+            break
+        time.sleep(0.25)
+    if not result_mp4:
+        raise RuntimeError("ComfyUI: mp4 not produced")
+
+    job_id = str(int(time.time() * 1000))
+    dst = RESULTS_DIR / f"{job_id}.mp4"
+    result_mp4.replace(dst)
+
+    out = {"ok": True, "mp4_path": str(dst), "exec_ms": int((time.time()-t0)*1000)}
+
+    if return_base64:
+        with open(dst, "rb") as f:
+            out["video_base64"] = "data:video/mp4;base64," + base64.b64encode(f.read()).decode()
+    return out
