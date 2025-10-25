@@ -1,0 +1,22 @@
+{
+  "input": {
+    "action":  {"name":"Action","type":"string","description":"health|run","default":"run"},
+    "prompt":  {"name":"Prompt","type":"string","default":""},
+    "user_id": {"name":"User ID","type":"string","default":"u1"},
+    "use_last":{"name":"Use last image","type":"boolean","default":false},
+    "image_base64": {"name":"Image (base64)","type":"string","default":""},
+    "width":  {"name":"Width","type":"number","default":1280},
+    "height": {"name":"Height","type":"number","default":720},
+    "steps":  {"name":"Steps","type":"number","default":40},
+    "cfg":    {"name":"CFG","type":"number","default":5.0},
+    "length": {"name":"Length (frames)","type":"number","default":81}
+  },
+  "output": {
+    "ok": "boolean",
+    "video": "string",
+    "seconds": "number",
+    "saved_path": "string",
+    "last_image_path": "string",
+    "estimated_cost_usd": "number"
+  }
+}
