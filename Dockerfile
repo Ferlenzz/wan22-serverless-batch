@@ -43,4 +43,13 @@ ENV WAN_CKPT_DIR=/runpod-volume/models/Wan2.2-TI2V-5B
 ENV BATCH_MAX_SIZE=20
 ENV BATCH_LINGER_SEC=5
 
+# SDK RunPod + полезные штуки для логов
+RUN pip install --no-cache-dir runpod==1.6.6 loguru
+
+# (не обязательно, но удобно если используешь FastAPI/uvicorn)
+# RUN pip install --no-cache-dir fastapi uvicorn
+
+# чтобы логи шли сразу
+ENV PYTHONUNBUFFERED=1
+
 CMD ["python3","-u","/app/handler.py"]
