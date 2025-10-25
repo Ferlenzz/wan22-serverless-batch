@@ -1,0 +1,24 @@
+{
+  "tests": [
+    {
+      "name": "smoke_enq",
+      "input": {
+        "action": "enq",
+        "user_id": "u1",
+        "prompt": "test clip",
+        "image_base64": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axhZC4AAAAASUVORK5CYII=",
+        "width": 256,
+        "height": 256,
+        "length": 8,
+        "steps": 4,
+        "cfg": 2.0
+      },
+      "timeout": 120000
+    },
+    {
+      "name": "smoke_health",
+      "input": { "action": "health" },
+      "timeout": 20000
+    }
+  ]
+}
