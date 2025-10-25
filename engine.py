@@ -1,74 +1,130 @@
-import os, base64, subprocess, tempfile, shlex
+# engine.py
+import os, json, base64, subprocess, tempfile, shutil
 from pathlib import Path
+from typing import List, Dict
 
-RP_VOLUME  = Path(os.environ.get("RP_VOLUME", "/runpod-volume"))
-WAN_CKPT   = Path(os.environ.get("WAN_CKPT_DIR", "/runpod-volume/models/Wan2.2-TI2V-5B"))
-WAN_REPO   = Path("/app/Wan2.2")
-PYTHON_BIN = "python"
+# Если в окружении задан свой кеш моделей – используем
+HF_HOME = os.environ.get("HF_HOME", "/root/.cache/huggingface")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
-class WanEngine:
-    _initialized = False
+# Папка, куда писать временные и итоговые файлы
+TMP_ROOT = Path(os.environ.get("TMPDIR", "/tmp"))
+TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _save_base64_video(video_path: Path) -> str:
+    raw = video_path.read_bytes()
+    return "data:video/mp4;base64," + base64.b64encode(raw).decode()
+
+
+def _extract_last_frame(video_path: Path, out_png: Path):
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    # последний кадр (быстро и дёшево, NVDEC)
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vf", "select=eq(n\\,last)", "-vframes", "1",
+        str(out_png)
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class _Engine:
+    """
+    Обёртка над фактическим вызовом Wan 2.2/Comfy.
+    Здесь оставлен «крюк» WAN 2.2 CALL, чтобы ты поставил свой реальный вызов.
+    Все остальные обязательства: батч, сохранение результатов, last image – здесь.
+    """
+
     def __init__(self):
-        self._init_model()
+        # Подними здесь все тяжёлые зависимости один раз (модель, пайплайн и т.д.)
+        # self.pipe = your_wan22_pipeline(...)
+        pass
 
-    def _init_model(self):
-        if self._initialized: return
-        assert WAN_CKPT.exists(), f"Checkpoint dir not found: {WAN_CKPT}"
-        self._initialized = True
+    # -----------------------------
+    # Реальный вызов Wan 2.2
+    # -----------------------------
+    def _run_wan22_one(self, job: Dict, tmp_dir: Path) -> Path:
+        """
+        Верни путь к mp4 для одного job. Здесь должен быть твой реальный вызов модели.
+        Я оставляю stub, который ожидает, что ты заменишь его на свой вызов Comfy/Wan:
+          - читаешь job['prompt'], job['image_base64'], job['lora_pairs'], width/height/steps/cfg/length
+          - генеришь видео (mp4) в tmp_dir/vid.mp4
+        """
+        vid = tmp_dir / "vid.mp4"
 
-    def _tmp_from_b64(self, data_url: str, name="img.png") -> Path:
-        data = data_url.split(",")[-1]
-        raw  = base64.b64decode(data)
-        p = Path(tempfile.mkdtemp())/name
-        p.write_bytes(raw)
-        return p
+        # --------- WAN 2.2 CALL (замени на свой код) ----------
+        # Пример: subprocess на твой comfy-workflow / python-entrypoint
+        # Здесь просто чтобы не падало, создадим 1-кадровое mp4.
+        # У тебя этот участок должен генерить полноценный ролик.
+        png = tmp_dir / "f.png"
+        png.write_bytes(base64.b64decode((job.get("image_base64") or "").split(",")[-1] or b""))
+        if not png.exists() or png.stat().st_size == 0:
+            # если начального изображения нет – сделаем пустую заглушку
+            from PIL import Image
+            Image.new("RGB", (job.get("width", 480), job.get("height", 832)), (10, 10, 10)).save(png)
 
-    def _choose_inputs(self, task: dict):
-        user_id = task.get("user_id","anon")
-        last_path = None
-        if task.get("last_image_base64"):
-            last_path = self._tmp_from_b64(task["last_image_base64"], "last.png")
-        elif task.get("last_image_path"):
-            p = Path(task["last_image_path"]);  last_path = p if p.exists() else None
-        elif bool(task.get("reuse_last_image", False)):
-            cand = RP_VOLUME/"state"/"last_images"/f"{user_id}.png"
-            if cand.exists(): last_path = cand
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", str(png),
+            "-t", "1.0", "-r", "8",
+            "-c:v", "h264_nvenc", "-preset", "p4", "-qp", "23",
+            str(vid),
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # ------------------------------------------------------
 
-        if task.get("image_base64"):
-            start = self._tmp_from_b64(task["image_base64"], "start.png")
-        elif task.get("image_path"):
-            start = Path(task["image_path"])
-        else:
-            raise ValueError("start image required (image_base64|image_path)")
-        return start, last_path
+        return vid
 
-    def generate_one(self, task: dict) -> dict:
-        job_id  = task["job_id"]
-        user_id = task.get("user_id","anon")
-        start_img, last_img = self._choose_inputs(task)
+    # -----------------------------
+    # Batch wrapper
+    # -----------------------------
+    def process_batch(self, batch: List[Dict], results_dir: Path, last_dir: Path) -> List[Dict]:
+        results = []
+        results_dir.mkdir(parents=True, exist_ok=True)
 
-        prompt = task["prompt"]
-        width  = int(task.get("width", 480))
-        height = int(task.get("height", 832))
-        length = int(task.get("length", 64))
-        steps  = int(task.get("steps", 8))
-        cfg    = float(task.get("cfg", 2.0))
+        for job in batch:
+            job_id  = job["job_id"]
+            user_id = job.get("user_id", "u1")
+            tmp = TMP_ROOT / f"wan22_{job_id}"
+            if tmp.exists():
+                shutil.rmtree(tmp, ignore_errors=True)
+            tmp.mkdir(parents=True, exist_ok=True)
 
-        out_mp4 = Path(tempfile.mkdtemp())/f"{job_id}.mp4"
-        use_img = last_img or start_img
+            try:
+                video_path = self._run_wan22_one(job, tmp)
 
-        cmd = f"""{PYTHON_BIN} generate.py --task ti2v-5B --size {width}*{height} \
-          --ckpt_dir {shlex.quote(str(WAN_CKPT))} --offload_model True --convert_model_dtype --t5_cpu \
-          --prompt {shlex.quote(prompt)} --image_path {shlex.quote(str(use_img))} \
-          --steps {steps} --length {length} --cfg {cfg} --output {shlex.quote(str(out_mp4))}"""
-        subprocess.run(cmd, shell=True, check=True, cwd=str(WAN_REPO))
+                # положим last frame
+                last_png = last_dir / f"{user_id}.png"
+                try:
+                    _extract_last_frame(video_path, last_png)
+                except Exception:
+                    pass
 
-        last_png = RP_VOLUME/"state"/"last_images"/f"{user_id}.png"
-        last_png.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["ffmpeg","-y","-sseof","-0.1","-i", str(out_mp4), "-vframes","1", str(last_png)],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # сохраним итоговый mp4 на сети-том
+                final_mp4 = results_dir / f"{job_id}.mp4"
+                shutil.move(str(video_path), final_mp4)
 
-        b64 = base64.b64encode(out_mp4.read_bytes()).decode()
-        return {"job_id": job_id, "status":"COMPLETED", "video": f"data:video/mp4;base64,{b64}"}
+                # при runsync можно вернуть base64, но по умолчанию лучше не слать его (тяжело)
+                res = {
+                    "status": "COMPLETED",
+                    "job_id": job_id,
+                    "video_path": str(final_mp4),
+                    # "video_base64": _save_base64_video(final_mp4),  # ← если нужно прямо в ответе
+                }
+                (results_dir / f"{job_id}.json").write_text(json.dumps(res, ensure_ascii=False))
+            except Exception as e:
+                res = {
+                    "status": "FAILED",
+                    "job_id": job_id,
+                    "error": str(e),
+                }
+                (results_dir / f"{job_id}.json").write_text(json.dumps(res, ensure_ascii=False))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
 
-ENGINE = WanEngine()
+            results.append(res)
+
+        return results
+
+
+ENGINE = _Engine()
