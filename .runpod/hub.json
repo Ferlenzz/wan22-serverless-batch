@@ -1,0 +1,18 @@
+{
+  "input": {
+    "action": {"name":"Action","type":"string","description":"health|warmup|gen|runsync","default":"gen"},
+    "prompt": {"name":"Prompt","type":"string","default":"cinematic portrait, soft rim light"},
+    "user_id": {"name":"User ID","type":"string","default":"u1"},
+    "use_last": {"name":"Use last image","type":"boolean","default": true},
+    "image_base64": {"name":"Image (base64)","type":"string","default": ""},
+    "width": {"name":"Width","type":"number","default":480},
+    "height": {"name":"Height","type":"number","default":832},
+    "steps": {"name":"Steps","type":"number","default":8},
+    "cfg": {"name":"CFG","type":"number","default":2.0},
+    "length": {"name":"Length","type":"number","default":81}
+  },
+  "output": {
+    "status": "string",
+    "output": "object"
+  }
+}
