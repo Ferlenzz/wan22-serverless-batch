@@ -1,4 +1,3 @@
-# Лёгкая база: CUDA 12.1 + cuDNN8 (runtime)
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
@@ -13,28 +12,28 @@ RUN python3 -m pip install --upgrade pip setuptools wheel packaging
 RUN pip install --index-url https://download.pytorch.org/whl/cu121 \
     torch==2.4.0 torchvision==0.19.0
 
-# Только xformers (готовое колесо под cu121), БЕЗ flash-attn
-RUN pip install \
-    xformers==0.0.27.post2 \
-    -f https://download.pytorch.org/whl/cu121
+# Ставим xformers (готовое колесо под cu121). FLASH-ATTN НЕ СТАВИМ.
+RUN pip install xformers==0.0.27.post2 -f https://download.pytorch.org/whl/cu121
 
 # Клонируем Wan2.2
 WORKDIR /app
 RUN git clone https://github.com/Wan-Video/Wan2.2.git /app/Wan2.2
 
-# Убираем любые упоминания flash-attn/xformers из requirements, чтобы не пересобирались
+# --------- ВАЖНО: жёстко вырезаем flash-attn/xformers из любых requirements ---------
 WORKDIR /app/Wan2.2
-RUN sed -i '/flash-attn/d;/xformers/d' requirements.txt
+# Создадим "пропиленный" requirements, куда НЕ попадут строки с flash(-|_)attn или xformers
+RUN awk 'BEGIN{IGNORECASE=1} !/flash[-_]?attn/ && !/xformers/ {print}' requirements.txt > /tmp/req-pruned.txt
 
-# Ставим остальные зависимости Wan2.2
-RUN pip install -r requirements.txt
+# Ставим зависимости из очищенного файла
+RUN pip install -r /tmp/req-pruned.txt
+# --------------------------------------------------------------------
 
 # Наш серверлесс-код
 WORKDIR /app
 COPY handler.py /app/handler.py
 COPY engine.py  /app/engine.py
 
-# На всякий: выключаем любые попытки автосборки flash-attn
+# На всякий: запретим любые автосборки flash-attn
 ENV FLASH_ATTENTION_SKIP_COMPILE=1
 ENV USE_FLASH_ATTENTION=0
 
