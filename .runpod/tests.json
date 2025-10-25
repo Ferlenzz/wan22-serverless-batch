@@ -1,12 +1,35 @@
-{
-  "input": {
-    "action": "run",
-    "prompt": "cinematic portrait, soft rim light",
-    "image_base64": "DATA_URL_OR_BASE64_IMAGE_HERE",
-    "width": 1280,
-    "height": 720,
-    "steps": 40,
-    "cfg": 5.0,
-    "length": 81
+[
+  {
+    "name": "health",
+    "input": { "action": "health" }
+  },
+  {
+    "name": "simple-gen",
+    "input": {
+      "action": "run",
+      "prompt": "cinematic portrait, soft rim light",
+      "user_id": "u1",
+      "use_last": false,
+      "image_base64": "<PUT_YOUR_BASE64_IMAGE>",
+      "width": 832,
+      "height": 480,
+      "steps": 40,
+      "cfg": 5.0,
+      "length": 81
+    }
+  },
+  {
+    "name": "use-last",
+    "input": {
+      "action": "run",
+      "prompt": "dramatic close-up, shallow depth of field",
+      "user_id": "u1",
+      "use_last": true,
+      "width": 832,
+      "height": 480,
+      "steps": 36,
+      "cfg": 4.8,
+      "length": 65
+    }
   }
-}
+]
