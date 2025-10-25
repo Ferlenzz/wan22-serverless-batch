@@ -11,13 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git ffmpeg libglib2.0-0 libgl1 curl \
  && rm -rf /var/lib/apt/lists/*
 
+# Upgrade core build tools
 RUN python3 -m pip install --upgrade pip setuptools wheel packaging
 
 # ---------- TORCH (cu121) ----------
 RUN pip install --index-url https://download.pytorch.org/whl/cu121 \
     torch==2.4.0 torchvision==0.19.0
 
-# XFormers (готовое колесо под cu121)
+# XFormers (готовое колесо под cu121). FLASH-ATTN не ставим.
 RUN pip install xformers==0.0.27.post2 -f https://download.pytorch.org/whl/cu121
 
 # ---------- WAN 2.2 ----------
@@ -26,11 +27,20 @@ RUN git clone https://github.com/Wan-Video/Wan2.2.git /app/Wan2.2
 
 WORKDIR /app/Wan2.2
 # Вырезаем flash-attn/xformers из requirements, чтобы ничего не компилировалось
-RUN awk 'BEGIN{IGNORECASE=1} !/flash[-_]?attn/ && !/xformers/ {print}' requirements.txt > /tmp/req-pruned.txt
-RUN pip install -r /tmp/req-pruned.txt
+RUN awk 'BEGIN{IGNORECASE=1} !/flash[-_]?attn/ && !/xformers/ {print}' requirements.txt > /tmp/req-pruned.txt \
+ && pip install -r /tmp/req-pruned.txt
 
-# Переходим на VAE 2.2 в image2video
-RUN sed -i 's/from \.modules\.vae2_1 import Wan2_1_VAE/from .modules.vae2_2 import Wan2_2_VAE/' /app/Wan2.2/wan/image2video.py \
+# Добиваем зависимости, которые иногда не подтягиваются из reqs и из-за этого воркер падал
+RUN pip install \
+    einops==0.7.0 \
+    einops-exts==0.0.4 \
+    "sentencepiece>=0.1.99" \
+    "timm>=0.9.12" \
+    decord==0.6.0
+
+# Принудительно переключаем Wan на VAE 2.2 (и не импортируем vae2_1 в __init__.py)
+RUN sed -i 's/from \.modules\.vae2_1 import Wan2_1_VAE/# (disabled) vae2_1 import/' /app/Wan2.2/wan/__init__.py \
+ && sed -i 's/from \.modules\.vae2_1 import Wan2_1_VAE/from .modules.vae2_2 import Wan2_2_VAE/' /app/Wan2.2/wan/image2video.py \
  && sed -i 's/self\.vae = Wan2_1_VAE/self.vae = Wan2_2_VAE/' /app/Wan2.2/wan/image2video.py
 
 # ---------- НАШ КОД ----------
@@ -42,8 +52,11 @@ COPY .runpod/hub.json   /app/.runpod/hub.json
 
 # ---------- PY DEPS (SDK/утилиты) ----------
 RUN python3 -m pip install --no-cache-dir \
-      "pillow>=10" "imageio[ffmpeg]>=2.34" "numpy>=1.26" \
-      "loguru>=0.7" "runpod==1.7.13"
+      pillow>=10 \
+      "imageio[ffmpeg]>=2.34" \
+      "numpy>=1.26" \
+      loguru>=0.7 \
+      runpod==1.7.13
 
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
