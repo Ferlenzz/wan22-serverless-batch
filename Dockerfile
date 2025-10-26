@@ -102,36 +102,46 @@ p.write_text(s, encoding="utf-8")
 print("patched (filtered load)", p)
 PY
 
-# ---------- ПАТЧ №2: diffusers VAE backend (WAN class + shape-filter, robust) ----------
+# ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE class + shape-filter, robust) ----------
 RUN python3 - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
 append = r'''
-# ---- Diffusers VAE backend (WAN class, robust load) ----
+# ---- Diffusers VAE backend (WAN if available, fallback to BASE; robust load) ----
 import os as _os, inspect as _inspect
 import torch as _torch
 from huggingface_hub import hf_hub_download
 import json as _json
 
-# Требуем именно AutoencoderKLWan (нужен diffusers>=0.31.0)
+# выбираем класс: сначала пробуем WAN, иначе обычный AutoencoderKL
 try:
     from diffusers import AutoencoderKLWan as _DiffVAE
-except Exception as _e:
-    raise RuntimeError("[VAE] AutoencoderKLWan is missing. Please use diffusers>=0.31.0") from _e
+    _WAN = True
+except Exception:
+    from diffusers import AutoencoderKL as _DiffVAE
+    _WAN = False
+
+def _filter_kwargs_for_ctor(cfg: dict, cls):
+    """Оставляем в cfg только те ключи, которые принимает __init__ выбранного класса."""
+    import inspect
+    sig = inspect.signature(cls.__init__)
+    allowed = set(sig.parameters.keys()) - {"self", "kwargs", "**kwargs"}
+    return {k: v for k, v in cfg.items() if k in allowed}
 
 def _vae_build_diffusers(_device):
     repo_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     token = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
-    # 1) берём конфиг и веса напрямую
+    # 1) тянем конфиг и веса напрямую
     cfg_path = hf_hub_download(repo_id=repo_id, filename="vae/config.json", token=token)
     w_path  = hf_hub_download(repo_id=repo_id, filename="vae/diffusion_pytorch_model.safetensors", token=token)
     with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = _json.load(f)
+        raw_cfg = _json.load(f)
 
-    # 2) создаём модель по конфигу WAN
+    # 2) создаём модель по конфигу
+    cfg = _filter_kwargs_for_ctor(raw_cfg, _DiffVAE) if not _WAN else raw_cfg
     vae = _DiffVAE.from_config(cfg)
 
     # 3) грузим веса и фильтруем строго по shape
@@ -146,16 +156,16 @@ def _vae_build_diffusers(_device):
     missing = [k for k in ms.keys() if k not in sd]
     skipped = [k for k in sd_full.keys() if k not in sd]
     vae.load_state_dict(sd, strict=False)
-    print(f"[VAE] WAN diffusers load: loaded={len(sd)} missing={len(missing)} skipped(mismatch)={len(skipped)}")
+    print(f"[VAE] diffusers load ({'WAN' if _WAN else 'BASE'}) strict=False: loaded={len(sd)} missing={len(missing)} skipped(mismatch)={len(skipped)}")
 
     # 4) dtype/device
     vae = vae.to(_device, dtype=_torch.float16 if _device.type == "cuda" else _torch.float32)
     vae.eval().requires_grad_(False)
     return vae
 
-# monkey-patch: при USE_DIFFUSERS_VAE=1 подменяем __init__ обнаруженного VAE-класса
+# monkey-patch: при USE_DIFFUSERS_VAE=1 подменяем __init__ найденного VAE-класса
 if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
-    print("[VAE] Using diffusers VAE backend (WAN class, robust)")
+    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE)")
     _g = globals()
     _candidates = [k for k,v in _g.items() if _inspect.isclass(v) and "VAE" in k]
     for _name in _candidates:
@@ -169,11 +179,11 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
         print("[VAE] patched class:", _name)
         break
 '''
-if "Diffusers VAE backend (WAN class, robust)" not in s:
+if "Diffusers VAE backend (WAN/BASE class" not in s:
     s = s + "\n" + append
 
 p.write_text(s, encoding="utf-8")
-print("patched (diffusers WAN backend)", p)
+print("patched (diffusers WAN/BASE backend)", p)
 PY
 
 # ---------- APP ----------
