@@ -1,35 +1,14 @@
 [
   {
     "name": "health",
-    "input": { "action": "health" }
-  },
-  {
-    "name": "simple-gen",
     "input": {
-      "action": "run",
-      "prompt": "cinematic portrait, soft rim light",
-      "user_id": "u1",
-      "use_last": false,
-      "image_base64": "<PUT_YOUR_BASE64_IMAGE>",
-      "width": 832,
-      "height": 480,
-      "steps": 40,
-      "cfg": 5.0,
-      "length": 81
+      "action": "health"
     }
   },
   {
-    "name": "use-last",
+    "name": "warmup",
     "input": {
-      "action": "run",
-      "prompt": "dramatic close-up, shallow depth of field",
-      "user_id": "u1",
-      "use_last": true,
-      "width": 832,
-      "height": 480,
-      "steps": 36,
-      "cfg": 4.8,
-      "length": 65
+      "action": "warmup"
     }
   }
 ]
