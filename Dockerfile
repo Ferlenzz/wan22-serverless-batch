@@ -4,12 +4,11 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 # ---------- SYSTEM ----------
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DEFAULT_TIMEOUT=180
+    PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev ca-certificates \
-    git curl ffmpeg libglib2.0-0 libgl1 libsndfile1 \
+    git ffmpeg libglib2.0-0 libgl1 curl \
  && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install --upgrade pip setuptools wheel packaging
@@ -26,11 +25,11 @@ WORKDIR /app
 RUN git clone https://github.com/Wan-Video/Wan2.2.git /app/Wan2.2
 
 WORKDIR /app/Wan2.2
-# Уберём flash-attn/xformers, чтобы ничего не компилировать
+# Вырезаем flash-attn/xformers из requirements, чтобы ничего не компилировалось
 RUN awk 'BEGIN{IGNORECASE=1} !/flash[-_]?attn/ && !/xformers/ {print}' requirements.txt > /tmp/req-pruned.txt
 RUN pip install -r /tmp/req-pruned.txt
 
-# Переключаем image2video на VAE 2.2
+# Переключаем VAE на 2.2 в image2video
 RUN sed -i 's/from \.modules\.vae2_1 import Wan2_1_VAE/from .modules.vae2_2 import Wan2_2_VAE/' /app/Wan2.2/wan/image2video.py \
  && sed -i 's/self\.vae = Wan2_1_VAE/self.vae = Wan2_2_VAE/' /app/Wan2.2/wan/image2video.py
 
@@ -41,18 +40,14 @@ COPY engine.py  /app/engine.py
 COPY .runpod/tests.json /app/.runpod/tests.json
 COPY .runpod/hub.json   /app/.runpod/hub.json
 
-# ---------- Утилиты / аудио / тензорные ----------
+# ---------- PY DEPS (SDK/утилиты и недостающее) ----------
 RUN python3 -m pip install --no-cache-dir \
       "pillow>=10" "imageio[ffmpeg]>=2.34" "numpy>=1.26" \
       "loguru>=0.7" "runpod==1.7.13" \
-      "librosa>=0.10.2.post1" "einops>=0.7.0"
+      "einops>=0.7.0" "librosa>=0.10.2.post1" "soundfile>=0.12.1" "decord>=0.6.0"
 
-# ---------- ВАЖНО: peft >= 0.17 для diffusers ----------
-# Ставим без зависимостей из zip архива GitHub через codeload (надёжно в CI).
-# Так мы удовлетворяем проверке версии в diffusers и не тянем лишние пакеты.
-RUN curl -L -o /tmp/peft-0.18.0.zip https://codeload.github.com/huggingface/peft/zip/refs/tags/v0.18.0 \
- && python3 -m pip install --no-cache-dir --no-deps /tmp/peft-0.18.0.zip \
- && rm -f /tmp/peft-0.18.0.zip
+# ВАЖНО: peft >= 0.17.0 нужно для diffusers — ставим с PyPI без зависимостей
+RUN python3 -m pip install --no-cache-dir --no-deps peft==0.18.0
 
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
