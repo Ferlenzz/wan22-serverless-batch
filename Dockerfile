@@ -100,20 +100,20 @@ p.write_text(s, encoding="utf-8")
 print("patched (filtered load)", p)
 PY
 
-# ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE + to_empty совместимый) ----------
+# ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE) с корректной логикой переноса ----------
 RUN python3 - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
 append = r'''
-# ---- Diffusers VAE backend (WAN if available, else BASE). Robust load with to_empty ----
+# ---- Diffusers VAE backend (WAN if available, else BASE). CPU-load fallback when no to_empty ----
 import os as _os, inspect as _inspect
 import torch as _torch
 from huggingface_hub import hf_hub_download
 import json as _json
 
-# 1) класс VAE: предпочитаем WAN, если доступен
+# 1) выбираем класс
 try:
     from diffusers import AutoencoderKLWan as _DiffVAE
     _WAN = True
@@ -136,27 +136,27 @@ def _vae_build_diffusers(_device):
     with open(cfg_path, "r", encoding="utf-8") as f:
         raw_cfg = _json.load(f)
 
-    # 3) создаём модель
+    # 3) создаём модель (на CPU)
     cfg = raw_cfg if _WAN else _filter_kwargs_for_ctor(raw_cfg, _DiffVAE)
-    vae = _DiffVAE.from_config(cfg)
-
-    # 4) выделяем параметры на целевом устройстве (совместимо со старыми сигнатурами to_empty)
+    vae = _DiffVAE.from_config(cfg)  # CPU by default
     dtype = _torch.float16 if _device.type == "cuda" else _torch.float32
-    alloc_ok = False
+
+    # 4) режим выделения параметров:
+    #    - если есть to_empty -> выделяем на целевом девайсе и грузим веса туда
+    #    - если нет to_empty -> оставляем на CPU, грузим веса на CPU, и только ПОТОМ переносим .to(device, dtype)
+    used_to_empty = False
     if hasattr(vae, "to_empty"):
         try:
-            vae = vae.to_empty(_device, dtype=dtype)   # новые сигнатуры torch
-            alloc_ok = True
+            vae = vae.to_empty(_device, dtype=dtype)
+            used_to_empty = True
         except TypeError:
             try:
-                vae = vae.to_empty(_device)            # старые сигнатуры без dtype
-                alloc_ok = True
+                vae = vae.to_empty(_device)  # без dtype
+                used_to_empty = True
             except Exception:
-                pass
-    if not alloc_ok:
-        vae = vae.to(_device, dtype=dtype)            # самый совместимый вариант
+                used_to_empty = False
 
-    # 5) грузим веса с фильтром по форме
+    # 5) грузим state_dict с фильтром по форме
     try:
         from safetensors.torch import load_file as _load_sf
         sd_full = _load_sf(w_path, device="cpu")
@@ -173,19 +173,22 @@ def _vae_build_diffusers(_device):
     except TypeError:
         vae.load_state_dict(sd, strict=False)
 
-    # 6) доводим dtype (если to_empty был без dtype)
-    try:
-        vae = vae.to(dtype=dtype)
-    except Exception:
-        pass
+    # 6) если не было to_empty (значит веса грузились на CPU) — переносим теперь
+    if not used_to_empty:
+        vae = vae.to(_device, dtype=dtype)
+    else:
+        # если to_empty было без dtype — доводим dtype
+        try:
+            vae = vae.to(dtype=dtype)
+        except Exception:
+            pass
 
     print(f"[VAE] diffusers load ({'WAN' if _WAN else 'BASE'}) strict=False: loaded={len(sd)} missing={len(missing)} skipped(mismatch)={len(skipped)}")
     vae.eval().requires_grad_(False)
     return vae
 
-# monkey-patch: при USE_DIFFUSERS_VAE=1 подменяем __init__ обнаруженного VAE-класса
 if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
-    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE) [to_empty]")
+    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE) [to_empty|cpu-load]")
     _g = globals()
     _candidates = [k for k,v in _g.items() if _inspect.isclass(v) and "VAE" in k]
     for _name in _candidates:
@@ -199,12 +202,14 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
         print("[VAE] patched class:", _name)
         break
 '''
-if "backend (WAN if present, else BASE) [to_empty]" not in s:
+# обновляем/вставляем блок
+marker = "backend (WAN if present, else BASE) [to_empty|cpu-load]"
+if marker not in s:
     s = s + "\n" + append
-
 p.write_text(s, encoding="utf-8")
-print("patched (diffusers WAN/BASE backend + to_empty)", p)
+print("patched (diffusers WAN/BASE backend with cpu-load fallback)", p)
 PY
+
 
 # ---------- APP ----------
 WORKDIR /app
