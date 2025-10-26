@@ -106,7 +106,7 @@ from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
-append = r"""
+append = r'''
 # ---- Diffusers VAE backend (WAN if available, else BASE). CPU-load fallback when no to_empty + CPU materialization ----
 import os as _os, inspect as _inspect
 import torch as _torch
