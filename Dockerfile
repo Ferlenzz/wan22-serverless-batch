@@ -52,7 +52,7 @@ RUN pip install --no-cache-dir --prefer-binary \
       pooch==1.8.2 soundfile==0.12.1 audioread==3.0.1 \
       librosa==0.10.2.post1
 
-# ---------- ПАТЧ: фильтрованная загрузка VAE ----------
+# ---------- ПАТЧ №1: фильтрованная загрузка VAE (fallback) ----------
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
@@ -87,8 +87,55 @@ s = re.sub(
     r"missing, mism = _load_filtered_state_dict(model, torch.load(\1))",
     s
 )
+
 p.write_text(s, encoding="utf-8")
-print("patched", p)
+print("patched (filtered load)", p)
+PY
+
+# ---------- ПАТЧ №2: переключатель на diffusers VAE ----------
+# При USE_DIFFUSERS_VAE=1 вместо .pth загружается AutoencoderKLWan из HF.
+RUN python3 - <<'PY'
+from pathlib import Path
+p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
+s = p.read_text(encoding="utf-8")
+
+append = r'''
+# ---- Diffusers VAE backend switch (monkey-patch) ----
+import os as _os
+try:
+    from diffusers import AutoencoderKLWan as _DiffVAE
+except Exception:
+    from diffusers import AutoencoderKL as _DiffVAE
+import torch as _torch
+
+def _vae_build_diffusers(_device):
+    return _DiffVAE.from_pretrained(
+        "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        subfolder="vae",
+        torch_dtype=_torch.float16 if _device.type == "cuda" else _torch.float32
+    ).to(_device).eval().requires_grad_(False)
+
+if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
+    print("[VAE] Using diffusers VAE backend (monkey-patch)")
+    # Пытаемся подменить наиболее вероятные классы VAE
+    _globals = globals()
+    for _name in ["WANVAE2_1","WanVAE2_1","VAE2_1","VAE","Wan2_1_VAE","WanVAE","Wan_AE"]:
+        _cls = _globals.get(_name)
+        if _cls and hasattr(_cls, "__init__"):
+            _orig_init = _cls.__init__
+            def _init(self, *a, **kw):
+                _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+                # просто создаём diffusers VAE и кладём в self.model
+                self.model = _vae_build_diffusers(_device)
+            _cls.__init__ = _init
+            print("[VAE] patched class:", _name)
+            break
+'''
+if "Diffusers VAE backend switch" not in s:
+    s = s + "\n" + append
+
+p.write_text(s, encoding="utf-8")
+print("patched (diffusers backend switch)", p)
 PY
 
 # ---------- APP ----------
@@ -107,6 +154,10 @@ ENV FLASH_ATTENTION_SKIP_COMPILE=1
 ENV USE_FLASH_ATTENTION=0
 ENV HF_HOME=/runpod-volume/.cache/huggingface
 ENV MPLCONFIGDIR=/tmp/matplotlib
+
+# переключаемся на diffusers-бэкенд VAE (можно убрать/поставить 0 для отката)
+ENV USE_DIFFUSERS_VAE=1
+
 # отключаем «быструю» загрузку HF (чтобы не требовался hf_transfer)
 ENV HF_ENABLE_HF_TRANSFER=
 ENV HF_HUB_ENABLE_HF_TRANSFER=
