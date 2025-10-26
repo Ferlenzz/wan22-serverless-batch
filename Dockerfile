@@ -68,7 +68,7 @@ import re
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
-helper = r'''
+helper = r"""
 def _load_filtered_state_dict(model, ckpt):
     ms = model.state_dict()
     ok, mism = {}, []
@@ -81,7 +81,7 @@ def _load_filtered_state_dict(model, ckpt):
     model.load_state_dict(ok, strict=False)
     print(f"[VAE] filtered load: loaded={len(ok)} missing={len(missing)} skipped(mismatch)={len(mism)}")
     return missing, mism
-'''
+"""
 if "def _load_filtered_state_dict" not in s:
     s = s.replace("import torch", "import torch\n" + helper, 1)
 
@@ -100,14 +100,14 @@ p.write_text(s, encoding="utf-8")
 print("patched (filtered load)", p)
 PY
 
-# ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE) с корректной логикой переноса ----------
+# ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE) с корректной логикой переноса + материализацией на CPU ----------
 RUN python3 - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
-append = r'''
-# ---- Diffusers VAE backend (WAN if available, else BASE). CPU-load fallback when no to_empty ----
+append = r"""
+# ---- Diffusers VAE backend (WAN if available, else BASE). CPU-load fallback when no to_empty + CPU materialization ----
 import os as _os, inspect as _inspect
 import torch as _torch
 from huggingface_hub import hf_hub_download
@@ -126,6 +126,28 @@ def _filter_kwargs_for_ctor(cfg: dict, cls):
     allowed = set(inspect.signature(cls.__init__).parameters.keys()) - {"self", "kwargs", "**kwargs"}
     return {k: v for k, v in cfg.items() if k in allowed}
 
+def _materialize_on_cpu(module):
+    \"\"\"Материализуем meta-параметры/буферы на CPU, чтобы .to(...) не падал.\"\"\"
+    import torch.nn as _nn
+    for name, p in list(module.named_parameters(recurse=True)):
+        if getattr(p, "is_meta", False):
+            mod = module
+            parts = name.split(".")
+            for part in parts[:-1]:
+                mod = getattr(mod, part)
+            last = parts[-1]
+            new = _nn.Parameter(_torch.empty_like(p, device="cpu"), requires_grad=False)
+            setattr(mod, last, new)
+    for name, b in list(module.named_buffers(recurse=True)):
+        if getattr(b, "is_meta", False):
+            mod = module
+            parts = name.split(".")
+            for part in parts[:-1]:
+                mod = getattr(mod, part)
+            last = parts[-1]
+            newb = _torch.empty_like(b, device="cpu")
+            mod._buffers[last] = newb
+
 def _vae_build_diffusers(_device):
     repo_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     token = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -142,11 +164,8 @@ def _vae_build_diffusers(_device):
     dtype = _torch.float16 if _device.type == "cuda" else _torch.float32
 
     # 4) режим выделения параметров:
-    #    - если есть to_empty -> выделяем на целевом девайсе и грузим веса туда
-    #    - если нет to_empty -> МАТЕРИАЛИЗУЕМ на CPU (to_empty('cpu') если есть), грузим на CPU, и только ПОТОМ переносим .to(device, dtype)
     used_to_empty = False
     has_to_empty = hasattr(vae, "to_empty")
-
     if has_to_empty:
         try:
             vae = vae.to_empty(_device, dtype=dtype)
@@ -166,11 +185,8 @@ def _vae_build_diffusers(_device):
         sd_full = _torch.load(w_path, map_location="cpu")
 
     # В CPU-ветке материализуем параметры на CPU до загрузки, чтобы не остались meta
-    if not used_to_empty and has_to_empty:
-        try:
-            vae = vae.to_empty("cpu")
-        except Exception:
-            pass
+    if not used_to_empty:
+        _materialize_on_cpu(vae)
 
     ms = vae.state_dict()
     sd = {k: v for k, v in sd_full.items() if k in ms and getattr(v, "shape", None) == getattr(ms[k], "shape", None)}
@@ -196,7 +212,7 @@ def _vae_build_diffusers(_device):
     return vae
 
 if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
-    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE) [to_empty|cpu-load]")
+    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE) [to_empty|cpu-load|materialize]")
     _g = globals()
     _candidates = [k for k,v in _g.items() if _inspect.isclass(v) and "VAE" in k]
     for _name in _candidates:
@@ -209,12 +225,12 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
         _cls.__init__ = _init
         print("[VAE] patched class:", _name)
         break
-'''
-marker = "backend (WAN if present, else BASE) [to_empty|cpu-load]"
+"""
+marker = "[to_empty|cpu-load|materialize]"
 if marker not in s:
     s = s + "\n" + append
 p.write_text(s, encoding="utf-8")
-print("patched (diffusers WAN/BASE backend with cpu-load fallback)", p)
+print("patched (diffusers WAN/BASE backend with cpu-load + materialize)", p)
 PY
 
 # ---------- APP ----------
