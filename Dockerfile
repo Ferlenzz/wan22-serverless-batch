@@ -127,7 +127,7 @@ def _filter_kwargs_for_ctor(cfg: dict, cls):
     return {k: v for k, v in cfg.items() if k in allowed}
 
 def _materialize_on_cpu(module):
-    \"\"\"Материализуем meta-параметры/буферы на CPU, чтобы .to(...) не падал.\"\"\"
+    """Материализуем meta-параметры/буферы на CPU, чтобы .to(...) не падал."""
     import torch.nn as _nn
     for name, p in list(module.named_parameters(recurse=True)):
         if getattr(p, "is_meta", False):
