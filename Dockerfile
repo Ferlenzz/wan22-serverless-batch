@@ -29,7 +29,7 @@ WORKDIR /app/Wan2.2
 RUN awk 'BEGIN{IGNORECASE=1} !/flash[-_]?attn/ && !/xformers/ {print}' requirements.txt > /tmp/req-pruned.txt
 RUN pip install -r /tmp/req-pruned.txt
 
-# Переходим на VAE 2.2 в image2video
+# Переключаем image2video на VAE 2.2
 RUN sed -i 's/from \.modules\.vae2_1 import Wan2_1_VAE/from .modules.vae2_2 import Wan2_2_VAE/' /app/Wan2.2/wan/image2video.py \
  && sed -i 's/self\.vae = Wan2_1_VAE/self.vae = Wan2_2_VAE/' /app/Wan2.2/wan/image2video.py
 
@@ -37,15 +37,18 @@ RUN sed -i 's/from \.modules\.vae2_1 import Wan2_1_VAE/from .modules.vae2_2 impo
 WORKDIR /app
 COPY handler.py /app/handler.py
 COPY engine.py  /app/engine.py
+# (не обязательно, но оставим на месте если используешь)
 COPY .runpod/tests.json /app/.runpod/tests.json
 COPY .runpod/hub.json   /app/.runpod/hub.json
 
-# ---------- PY DEPS (SDK/утилиты + аудио + PEFT) ----------
+# ---------- PY DEPS (SDK/утилиты и фиксы версий) ----------
+# ВАЖНО: peft >= 0.17.0 для совместимости с diffusers — ставим явную современную версию.
 RUN python3 -m pip install --no-cache-dir \
-      pillow>=10 imageio[ffmpeg]>=2.34 numpy>=1.26 loguru>=0.7 runpod==1.7.13 \
-      einops sentencepiece timm decord safetensors \
-      librosa==0.10.2.post1 numba==0.58.1 llvmlite==0.41.1 soundfile==0.12.1 audioread==3.0.0 scipy==1.11.4 \
-      peft==0.12.0 transformers==4.41.2 accelerate==0.33.0
+      "pillow>=10" "imageio[ffmpeg]>=2.34" "numpy>=1.26" \
+      "loguru>=0.7" "runpod==1.7.13" \
+      "einops>=0.7.0" "librosa>=0.10.2.post1" "soundfile==0.12.1" \
+      "decord==0.6.0" \
+      "peft==0.19.0"
 
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
