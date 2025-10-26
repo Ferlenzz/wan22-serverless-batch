@@ -43,6 +43,7 @@ RUN pip install --no-cache-dir --prefer-binary \
 RUN pip install --no-cache-dir --prefer-binary \
       diffusers==0.31.0 transformers==4.44.2 accelerate==0.34.2 \
       peft==0.17.1
+
 # жёстко гарантируем версию diffusers в рантайме
 RUN pip uninstall -y diffusers || true && \
     pip install --no-cache-dir --prefer-binary --upgrade --force-reinstall diffusers==0.31.0
@@ -100,9 +101,8 @@ p.write_text(s, encoding="utf-8")
 print("patched (filtered load)", p)
 PY
 
-# ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE) с корректной логикой переноса + материализацией на CPU ----------
-# ломаем кеш слоёв при изменениях патча
-ARG PATCH_REV=3
+# ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE) + CPU-load + materialize + fix nn.Module.__init__ ----------
+ARG PATCH_REV=4
 RUN echo "patch rev ${PATCH_REV}" && python3 - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
@@ -221,6 +221,12 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
         if not _cls or not hasattr(_cls, "__init__"):
             continue
         def _init(self, *a, **kw):
+            import torch.nn as _nn
+            # критично: обязательно инициализируем базовый nn.Module
+            try:
+                _nn.Module.__init__(self)
+            except Exception:
+                pass
             _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
             self.model = _vae_build_diffusers(_device)
         _cls.__init__ = _init
@@ -231,7 +237,7 @@ marker = "[to_empty|cpu-load|materialize]"
 if marker not in s:
     s = s + "\n" + append
 p.write_text(s, encoding="utf-8")
-print("patched (diffusers WAN/BASE backend with cpu-load + materialize)", p)
+print("patched (diffusers WAN/BASE backend with cpu-load + materialize + nn.Module.__init__ fix)", p)
 PY
 
 # ---------- APP ----------
