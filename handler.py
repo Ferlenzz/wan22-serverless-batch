@@ -2,42 +2,37 @@ import os, time
 from loguru import logger
 import runpod
 
-from engine import generate_one
+from engine import generate_one, warmup
 
-# приблизительная ставка $/сек (скорость биллинга на serverless)
-RATE_USD_PER_SEC = float(os.environ.get('COST_RATE_USD_PER_SEC', '0.00031'))
+RATE_USD_PER_SEC = float(os.environ.get('COST_RATE_USD_PER_SEC', '0.00031'))  # ~ $0.31/hr
 
 def handler(event):
-    """
-    Ожидаемый input:
-      action: 'health' | 'run'
-      prompt, image_base64, width, height, steps, cfg, length,
-      use_last (bool), user_id (str)
-    """
-    inp = (event or {}).get('input') or {}
-    action = (inp.get('action') or 'run').lower()
+    payload = event.get("input") or {}
+    action = (payload.get("action") or "run").lower()
 
-    if action == 'health':
-        return {'ok': True, 'status': 'ready'}
+    if action in ("health", "status"):
+        return {"ok": True, "status": "ready"}
+
+    if action == "warmup":
+        return {"ok": True, **warmup()}
 
     t0 = time.time()
-    res = generate_one(inp)
-    exec_secs = time.time() - t0
+    try:
+        res = generate_one(payload)
+    except Exception as e:
+        logger.exception("Generation failed")
+        return {"ok": False, "error": str(e)}
 
-    if not res.get('ok'):
-        return {'ok': False, 'error': res.get('error', 'unknown')}
-
-    cost = exec_secs * RATE_USD_PER_SEC
-    out = {
-        'ok': True,
-        'video': res['video_b64'],
-        'seconds': res['seconds'],
-        'saved_path': res['path'],
-        'last_image_path': res.get('last_image_path'),
-        'estimated_cost_usd': round(cost, 6),
+    sec = float(res.get("seconds", time.time() - t0))
+    cost = round(sec * RATE_USD_PER_SEC, 6)
+    return {
+        "ok": True,
+        "video": res["video_b64"],
+        "seconds": sec,
+        "saved_path": res["path"],
+        "last_image_path": res.get("last_image_path"),
+        "estimated_cost_usd": cost,
     }
-    logger.info("Done in {}s, saved {}", res['seconds'], res['path'])
-    return out
 
 if __name__ == "__main__":
     logger.info("Starting RunPod handler...")
