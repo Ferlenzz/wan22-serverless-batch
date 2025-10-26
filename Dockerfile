@@ -40,14 +40,12 @@ RUN pip install --no-cache-dir --prefer-binary \
       safetensors==0.4.5 einops==0.7.0 huggingface_hub==0.20.3
 
 # ---------- Diffusers / Transformers / PEFT ----------
-# сначала ставим как обычно...
 RUN pip install --no-cache-dir --prefer-binary \
       diffusers==0.31.0 transformers==4.44.2 accelerate==0.34.2 \
       peft==0.17.1
-# ... а затем ЖЁСТКО гарантируем нужную версию diffusers на рантайме
+# жёстко гарантируем версию diffusers в рантайме
 RUN pip uninstall -y diffusers || true && \
     pip install --no-cache-dir --prefer-binary --upgrade --force-reinstall diffusers==0.31.0
-# sanity-check на этапе сборки
 RUN python3 - <<'PY'
 import diffusers
 v = diffusers.__version__
@@ -55,7 +53,7 @@ assert v.startswith("0.31."), f"diffusers version must be 0.31.x, got {v}"
 print("[check] diffusers", v)
 PY
 
-# ---------- AUDIO STACK (librosa и зависимости; всё в колёсах) ----------
+# ---------- AUDIO STACK (librosa и зависимости) ----------
 RUN pip install --no-cache-dir --prefer-binary \
       scipy==1.11.4 \
       numba==0.60.0 llvmlite==0.43.0 \
@@ -102,7 +100,7 @@ p.write_text(s, encoding="utf-8")
 print("patched (filtered load)", p)
 PY
 
-# ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE class + shape-filter, robust) ----------
+# ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE + to_empty совместимый) ----------
 RUN python3 - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
@@ -115,7 +113,7 @@ import torch as _torch
 from huggingface_hub import hf_hub_download
 import json as _json
 
-# 1) берём WAN-класс, если он есть, иначе — базовый AutoencoderKL
+# 1) класс VAE: предпочитаем WAN, если доступен
 try:
     from diffusers import AutoencoderKLWan as _DiffVAE
     _WAN = True
@@ -124,7 +122,6 @@ except Exception:
     _WAN = False
 
 def _filter_kwargs_for_ctor(cfg: dict, cls):
-    """Оставляем в cfg только параметры, которые реально принимает __init__ выбранного класса."""
     import inspect
     allowed = set(inspect.signature(cls.__init__).parameters.keys()) - {"self", "kwargs", "**kwargs"}
     return {k: v for k, v in cfg.items() if k in allowed}
@@ -133,22 +130,31 @@ def _vae_build_diffusers(_device):
     repo_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     token = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
-    # 2) тянем конфиг и веса
+    # 2) конфиг + веса
     cfg_path = hf_hub_download(repo_id=repo_id, filename="vae/config.json", token=token)
     w_path  = hf_hub_download(repo_id=repo_id, filename="vae/diffusion_pytorch_model.safetensors", token=token)
     with open(cfg_path, "r", encoding="utf-8") as f:
         raw_cfg = _json.load(f)
 
-    # 3) создаём экземпляр
+    # 3) создаём модель
     cfg = raw_cfg if _WAN else _filter_kwargs_for_ctor(raw_cfg, _DiffVAE)
     vae = _DiffVAE.from_config(cfg)
 
-    # 4) СНАЧАЛА выделяем веса на нужном девайсе (иначе meta-ошибка), ПОТОМ грузим state_dict
+    # 4) выделяем параметры на целевом устройстве (совместимо со старыми сигнатурами to_empty)
     dtype = _torch.float16 if _device.type == "cuda" else _torch.float32
+    alloc_ok = False
     if hasattr(vae, "to_empty"):
-        vae = vae.to_empty(_device, dtype=dtype)  # torch>=2.0
-    else:
-        vae = vae.to(_device, dtype=dtype)
+        try:
+            vae = vae.to_empty(_device, dtype=dtype)   # новые сигнатуры torch
+            alloc_ok = True
+        except TypeError:
+            try:
+                vae = vae.to_empty(_device)            # старые сигнатуры без dtype
+                alloc_ok = True
+            except Exception:
+                pass
+    if not alloc_ok:
+        vae = vae.to(_device, dtype=dtype)            # самый совместимый вариант
 
     # 5) грузим веса с фильтром по форме
     try:
@@ -162,14 +168,18 @@ def _vae_build_diffusers(_device):
     missing = [k for k in ms.keys() if k not in sd]
     skipped = [k for k in sd_full.keys() if k not in sd]
 
-    # в новых torch есть assign=True (вписывает тензоры без копирования), но оставим совместимым
     try:
         vae.load_state_dict(sd, strict=False, assign=True)
     except TypeError:
         vae.load_state_dict(sd, strict=False)
 
-    print(f"[VAE] diffusers load ({'WAN' if _WAN else 'BASE'}) strict=False: loaded={len(sd)} missing={len(missing)} skipped(mismatch)={len(skipped)}")
+    # 6) доводим dtype (если to_empty был без dtype)
+    try:
+        vae = vae.to(dtype=dtype)
+    except Exception:
+        pass
 
+    print(f"[VAE] diffusers load ({'WAN' if _WAN else 'BASE'}) strict=False: loaded={len(sd)} missing={len(missing)} skipped(mismatch)={len(skipped)}")
     vae.eval().requires_grad_(False)
     return vae
 
@@ -195,7 +205,6 @@ if "backend (WAN if present, else BASE) [to_empty]" not in s:
 p.write_text(s, encoding="utf-8")
 print("patched (diffusers WAN/BASE backend + to_empty)", p)
 PY
-
 
 # ---------- APP ----------
 WORKDIR /app
