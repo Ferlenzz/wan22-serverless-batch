@@ -40,12 +40,12 @@ COPY engine.py  /app/engine.py
 COPY .runpod/tests.json /app/.runpod/tests.json
 COPY .runpod/hub.json   /app/.runpod/hub.json
 
-# ---------- PY DEPS (SDK/утилиты) ----------
-# + добавлены аудио-зависимости (librosa и др.), из-за которых падал импорт AudioEncoder
+# ---------- PY DEPS (SDK/утилиты + аудио + PEFT) ----------
 RUN python3 -m pip install --no-cache-dir \
       pillow>=10 imageio[ffmpeg]>=2.34 numpy>=1.26 loguru>=0.7 runpod==1.7.13 \
-      einops einops-exts sentencepiece timm decord \
-      librosa==0.10.2.post1 numba==0.58.1 llvmlite==0.41.1 soundfile==0.12.1 audioread==3.0.0 scipy==1.11.4
+      einops sentencepiece timm decord safetensors \
+      librosa==0.10.2.post1 numba==0.58.1 llvmlite==0.41.1 soundfile==0.12.1 audioread==3.0.0 scipy==1.11.4 \
+      peft==0.12.0 transformers==4.41.2 accelerate==0.33.0
 
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
