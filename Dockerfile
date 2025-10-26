@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev ca-certificates \
-    git ffmpeg libglib2.0-0 libgl1 curl \
+    git curl ffmpeg libglib2.0-0 libgl1 libsndfile1 \
  && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install --upgrade pip setuptools wheel packaging
@@ -29,7 +29,7 @@ WORKDIR /app/Wan2.2
 RUN awk 'BEGIN{IGNORECASE=1} !/flash[-_]?attn/ && !/xformers/ {print}' requirements.txt > /tmp/req-pruned.txt
 RUN pip install -r /tmp/req-pruned.txt
 
-# Переключаем VAE на 2.2 в image2video
+# Перевод на VAE 2.2 в image2video
 RUN sed -i 's/from \.modules\.vae2_1 import Wan2_1_VAE/from .modules.vae2_2 import Wan2_2_VAE/' /app/Wan2.2/wan/image2video.py \
  && sed -i 's/self\.vae = Wan2_1_VAE/self.vae = Wan2_2_VAE/' /app/Wan2.2/wan/image2video.py
 
@@ -40,14 +40,21 @@ COPY engine.py  /app/engine.py
 COPY .runpod/tests.json /app/.runpod/tests.json
 COPY .runpod/hub.json   /app/.runpod/hub.json
 
-# ---------- PY DEPS (SDK/утилиты и недостающее) ----------
-RUN python3 -m pip install --no-cache-dir \
-      "pillow>=10" "imageio[ffmpeg]>=2.34" "numpy>=1.26" \
-      "loguru>=0.7" "runpod==1.7.13" \
-      "einops>=0.7.0" "librosa>=0.10.2.post1" "soundfile>=0.12.1" "decord>=0.6.0"
-
-# ВАЖНО: peft >= 0.17.0 нужно для diffusers — ставим с PyPI без зависимостей
-RUN python3 -m pip install --no-cache-dir --no-deps peft==0.18.0
+# ---------- PY DEPS (SDK/утилиты) ----------
+# Важно: peft >= 0.17.0 для совместимости с diffusers, ставим 0.18.0 (без --no-deps).
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    python3 -m pip install --no-cache-dir \
+      pillow>=10 \
+      "imageio[ffmpeg]>=2.34" \
+      numpy>=1.26 \
+      loguru>=0.7 \
+      runpod==1.7.13 \
+      einops>=0.7.0 \
+      librosa==0.10.2.post1 \
+      soundfile==0.12.1 \
+      decord>=0.6.0 \
+      diffusers==0.30.2 \
+      peft==0.18.0
 
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
@@ -56,6 +63,10 @@ ENV BATCH_MAX_SIZE=20
 ENV BATCH_LINGER_SEC=5
 ENV FLASH_ATTENTION_SKIP_COMPILE=1
 ENV USE_FLASH_ATTENTION=0
+# кэш HF на общий том, чтобы ускорить прогрев
+ENV HF_HOME=/runpod-volume/.cache/huggingface
+# на всякий случай для backend без $HOME
+ENV MPLCONFIGDIR=/tmp/matplotlib
 
 # ---------- ENTRY ----------
 CMD ["python3","-u","/app/handler.py"]
