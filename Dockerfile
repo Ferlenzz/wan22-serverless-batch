@@ -41,7 +41,7 @@ RUN pip install --no-cache-dir --prefer-binary \
 
 # ---------- Diffusers / Transformers / PEFT ----------
 RUN pip install --no-cache-dir --prefer-binary \
-      diffusers==0.31.0 transformers==4.44.2 accelerate==0.34.2 \
+      diffusers>=0.33.0 transformers==4.44.2 accelerate==0.34.2 \
       peft==0.17.1
 
 # жёстко гарантируем версию diffusers в рантайме
