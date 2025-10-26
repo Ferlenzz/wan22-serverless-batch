@@ -41,7 +41,7 @@ RUN pip install --no-cache-dir --prefer-binary \
 
 # ---------- Diffusers / Transformers / PEFT ----------
 RUN pip install --no-cache-dir --prefer-binary \
-      diffusers==0.30.2 transformers==4.44.2 accelerate==0.34.2 \
+      diffusers==0.31.0 transformers==4.44.2 accelerate==0.34.2 \
       peft==0.17.1
 
 # ---------- AUDIO STACK (librosa и зависимости; всё в колёсах) ----------
@@ -52,7 +52,7 @@ RUN pip install --no-cache-dir --prefer-binary \
       pooch==1.8.2 soundfile==0.12.1 audioread==3.0.1 \
       librosa==0.10.2.post1
 
-# ---------- ПАТЧ №1: фильтрованная загрузка VAE (fallback) ----------
+# ---------- ПАТЧ №1: фильтрованная загрузка VAE из .pth (fallback) ----------
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
@@ -87,64 +87,70 @@ s = re.sub(
     r"missing, mism = _load_filtered_state_dict(model, torch.load(\1))",
     s
 )
-
 p.write_text(s, encoding="utf-8")
 print("patched (filtered load)", p)
 PY
 
-# ---------- ПАТЧ №2: diffusers VAE backend (robust, no strict) ----------
+# ---------- ПАТЧ №2: diffusers VAE backend (WAN class + shape-filter, robust) ----------
 RUN python3 - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
 append = r'''
-# ---- Robust Diffusers VAE backend (no strict state_dict) ----
-import os as _os
+# ---- Diffusers VAE backend (WAN class, robust load) ----
+import os as _os, inspect as _inspect
 import torch as _torch
 from huggingface_hub import hf_hub_download
 import json as _json
 
+# Требуем именно AutoencoderKLWan (нужен diffusers>=0.31.0)
 try:
     from diffusers import AutoencoderKLWan as _DiffVAE
-except Exception:
-    from diffusers import AutoencoderKL as _DiffVAE
+except Exception as _e:
+    raise RuntimeError("[VAE] AutoencoderKLWan is missing. Please use diffusers>=0.31.0") from _e
 
 def _vae_build_diffusers(_device):
     repo_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     token = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    # 1) тянем config и веса напрямую
+
+    # 1) берём конфиг и веса напрямую
     cfg_path = hf_hub_download(repo_id=repo_id, filename="vae/config.json", token=token)
     w_path  = hf_hub_download(repo_id=repo_id, filename="vae/diffusion_pytorch_model.safetensors", token=token)
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = _json.load(f)
-    # 2) создаём модель по конфигу
+
+    # 2) создаём модель по конфигу WAN
     vae = _DiffVAE.from_config(cfg)
-    # 3) грузим веса без строгих проверок
+
+    # 3) грузим веса и фильтруем строго по shape
     try:
         from safetensors.torch import load_file as _load_sf
-        sd = _load_sf(w_path, device="cpu")
+        sd_full = _load_sf(w_path, device="cpu")
     except Exception:
-        sd = _torch.load(w_path, map_location="cpu")
-    missing, unexpected = vae.load_state_dict(sd, strict=False)
-    print(f"[VAE] diffusers load (strict=False): missing={len(missing)} unexpected={len(unexpected)}")
-    # 4) перенос на нужное устройство/тип
+        sd_full = _torch.load(w_path, map_location="cpu")
+
+    ms = vae.state_dict()
+    sd = {k: v for k, v in sd_full.items() if k in ms and getattr(v, "shape", None) == getattr(ms[k], "shape", None)}
+    missing = [k for k in ms.keys() if k not in sd]
+    skipped = [k for k in sd_full.keys() if k not in sd]
+    vae.load_state_dict(sd, strict=False)
+    print(f"[VAE] WAN diffusers load: loaded={len(sd)} missing={len(missing)} skipped(mismatch)={len(skipped)}")
+
+    # 4) dtype/device
     vae = vae.to(_device, dtype=_torch.float16 if _device.type == "cuda" else _torch.float32)
     vae.eval().requires_grad_(False)
     return vae
 
-# monkey-patch: при USE_DIFFUSERS_VAE=1 подменяем инициализацию класса
-import inspect as _inspect
+# monkey-patch: при USE_DIFFUSERS_VAE=1 подменяем __init__ обнаруженного VAE-класса
 if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
-    print("[VAE] Using diffusers VAE backend (robust)")
+    print("[VAE] Using diffusers VAE backend (WAN class, robust)")
     _g = globals()
-    # найди класс VAE (имя может меняться между ревизиями)
     _candidates = [k for k,v in _g.items() if _inspect.isclass(v) and "VAE" in k]
     for _name in _candidates:
         _cls = _g.get(_name)
-        if not _cls or not hasattr(_cls, "__init__"): 
+        if not _cls or not hasattr(_cls, "__init__"):
             continue
-        _orig_init = _cls.__init__
         def _init(self, *a, **kw):
             _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
             self.model = _vae_build_diffusers(_device)
@@ -152,13 +158,12 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
         print("[VAE] patched class:", _name)
         break
 '''
-if "Robust Diffusers VAE backend" not in s:
+if "Diffusers VAE backend (WAN class, robust)" not in s:
     s = s + "\n" + append
 
 p.write_text(s, encoding="utf-8")
-print("patched (robust diffusers backend)", p)
+print("patched (diffusers WAN backend)", p)
 PY
-
 
 # ---------- APP ----------
 WORKDIR /app
@@ -177,7 +182,7 @@ ENV USE_FLASH_ATTENTION=0
 ENV HF_HOME=/runpod-volume/.cache/huggingface
 ENV MPLCONFIGDIR=/tmp/matplotlib
 
-# переключаемся на diffusers-бэкенд VAE (можно убрать/поставить 0 для отката)
+# включаем diffusers-бэкенд VAE
 ENV USE_DIFFUSERS_VAE=1
 
 # отключаем «быструю» загрузку HF (чтобы не требовался hf_transfer)
