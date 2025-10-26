@@ -2,15 +2,13 @@
 set -e
 
 python3 - <<'PY'
-import os, torch, sys
+import os, torch
 try:
-    import diffusers
-    dv = diffusers.__version__
+    import diffusers; dv = diffusers.__version__
 except Exception as e:
     dv = f"<not-importable: {e}>"
 try:
-    import transformers
-    tv = transformers.__version__
+    import transformers; tv = transformers.__version__
 except Exception as e:
     tv = f"<not-importable: {e}>"
 
