@@ -41,7 +41,7 @@ COPY .runpod/tests.json /app/.runpod/tests.json
 COPY .runpod/hub.json   /app/.runpod/hub.json
 
 # ---------- PY DEPS (SDK/утилиты) ----------
-# Важно: peft >= 0.17.0 для совместимости с diffusers, ставим 0.18.0 (без --no-deps).
+# Важно: peft >= 0.17.0. Ставим 0.17.1 (0.18.0 недоступен в текущем индексе).
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
     python3 -m pip install --no-cache-dir \
       pillow>=10 \
@@ -54,7 +54,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
       soundfile==0.12.1 \
       decord>=0.6.0 \
       diffusers==0.30.2 \
-      peft==0.18.0
+      peft==0.17.1
 
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
@@ -63,9 +63,8 @@ ENV BATCH_MAX_SIZE=20
 ENV BATCH_LINGER_SEC=5
 ENV FLASH_ATTENTION_SKIP_COMPILE=1
 ENV USE_FLASH_ATTENTION=0
-# кэш HF на общий том, чтобы ускорить прогрев
+# кэш HF на общий том — ускоряет холодный старт
 ENV HF_HOME=/runpod-volume/.cache/huggingface
-# на всякий случай для backend без $HOME
 ENV MPLCONFIGDIR=/tmp/matplotlib
 
 # ---------- ENTRY ----------
