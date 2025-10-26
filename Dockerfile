@@ -27,22 +27,30 @@ ARG WAN_REF=main
 RUN git clone https://github.com/Wan-Video/Wan2.2.git /app/Wan2.2 && \
     cd /app/Wan2.2 && git fetch --all --tags && git checkout ${WAN_REF}
 
-# Прячем flash-attn/xformers из reqs, чтобы ничего не компилилось
+# убираем flash-attn/xformers из requirements (чтобы не компилились)
 WORKDIR /app/Wan2.2
 RUN awk 'BEGIN{IGNORECASE=1} !/flash[-_]?attn/ && !/xformers/ {print}' requirements.txt > /tmp/req-pruned.txt && \
     pip install --no-cache-dir --prefer-binary -r /tmp/req-pruned.txt
 
-# ---------- Extra deps (runtime) ----------
-# Разбиваем на 2 шага, чтобы проще диагностировать, и используем --prefer-binary
+# ---------- Base runtime deps ----------
 RUN pip install --no-cache-dir --prefer-binary \
       runpod==1.6.2 loguru==0.7.2 pillow==10.4.0 \
       imageio==2.36.0 imageio-ffmpeg==0.5.1 numpy==1.26.4 \
       decord==0.6.0 opencv-python-headless==4.10.0.84 \
       safetensors==0.4.5 einops==0.7.0 huggingface_hub==0.20.3
 
+# ---------- Diffusers / Transformers / PEFT ----------
 RUN pip install --no-cache-dir --prefer-binary \
       diffusers==0.30.2 transformers==4.44.2 accelerate==0.34.2 \
       peft==0.17.1
+
+# ---------- AUDIO STACK (librosa и зависимости; всё в колёсах) ----------
+RUN pip install --no-cache-dir --prefer-binary \
+      scipy==1.11.4 \
+      numba==0.60.0 llvmlite==0.43.0 \
+      scikit-learn==1.3.2 joblib==1.3.2 threadpoolctl==3.2.0 \
+      pooch==1.8.2 soundfile==0.12.1 audioread==3.0.1 \
+      librosa==0.10.2.post1
 
 # ---------- ПАТЧ: фильтрованная загрузка VAE ----------
 RUN python3 - <<'PY'
@@ -50,6 +58,7 @@ from pathlib import Path
 import re
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
+
 helper = r'''
 def _load_filtered_state_dict(model, ckpt):
     ms = model.state_dict()
@@ -66,6 +75,8 @@ def _load_filtered_state_dict(model, ckpt):
 '''
 if "def _load_filtered_state_dict" not in s:
     s = s.replace("import torch", "import torch\n" + helper, 1)
+
+# покрываем варианты с/без assign=
 s = re.sub(
     r"model\.load_state_dict\(\s*torch\.load\(([^)]+)\)\s*,\s*assign=True\s*\)",
     r"missing, mism = _load_filtered_state_dict(model, torch.load(\1))",
@@ -96,6 +107,7 @@ ENV FLASH_ATTENTION_SKIP_COMPILE=1
 ENV USE_FLASH_ATTENTION=0
 ENV HF_HOME=/runpod-volume/.cache/huggingface
 ENV MPLCONFIGDIR=/tmp/matplotlib
+# отключаем «быструю» загрузку HF (чтобы не требовался hf_transfer)
 ENV HF_ENABLE_HF_TRANSFER=
 ENV HF_HUB_ENABLE_HF_TRANSFER=
 
