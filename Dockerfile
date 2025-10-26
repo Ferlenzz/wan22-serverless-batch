@@ -109,13 +109,13 @@ p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
 append = r'''
-# ---- Diffusers VAE backend (WAN if available, fallback to BASE; robust load) ----
+# ---- Diffusers VAE backend (WAN if available, else BASE). Robust load with to_empty ----
 import os as _os, inspect as _inspect
 import torch as _torch
 from huggingface_hub import hf_hub_download
 import json as _json
 
-# выбираем класс: сначала пробуем WAN, иначе обычный AutoencoderKL
+# 1) берём WAN-класс, если он есть, иначе — базовый AutoencoderKL
 try:
     from diffusers import AutoencoderKLWan as _DiffVAE
     _WAN = True
@@ -124,27 +124,33 @@ except Exception:
     _WAN = False
 
 def _filter_kwargs_for_ctor(cfg: dict, cls):
-    """Оставляем в cfg только те ключи, которые принимает __init__ выбранного класса."""
+    """Оставляем в cfg только параметры, которые реально принимает __init__ выбранного класса."""
     import inspect
-    sig = inspect.signature(cls.__init__)
-    allowed = set(sig.parameters.keys()) - {"self", "kwargs", "**kwargs"}
+    allowed = set(inspect.signature(cls.__init__).parameters.keys()) - {"self", "kwargs", "**kwargs"}
     return {k: v for k, v in cfg.items() if k in allowed}
 
 def _vae_build_diffusers(_device):
     repo_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     token = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
-    # 1) тянем конфиг и веса напрямую
+    # 2) тянем конфиг и веса
     cfg_path = hf_hub_download(repo_id=repo_id, filename="vae/config.json", token=token)
     w_path  = hf_hub_download(repo_id=repo_id, filename="vae/diffusion_pytorch_model.safetensors", token=token)
     with open(cfg_path, "r", encoding="utf-8") as f:
         raw_cfg = _json.load(f)
 
-    # 2) создаём модель по конфигу
-    cfg = _filter_kwargs_for_ctor(raw_cfg, _DiffVAE) if not _WAN else raw_cfg
+    # 3) создаём экземпляр
+    cfg = raw_cfg if _WAN else _filter_kwargs_for_ctor(raw_cfg, _DiffVAE)
     vae = _DiffVAE.from_config(cfg)
 
-    # 3) грузим веса и фильтруем строго по shape
+    # 4) СНАЧАЛА выделяем веса на нужном девайсе (иначе meta-ошибка), ПОТОМ грузим state_dict
+    dtype = _torch.float16 if _device.type == "cuda" else _torch.float32
+    if hasattr(vae, "to_empty"):
+        vae = vae.to_empty(_device, dtype=dtype)  # torch>=2.0
+    else:
+        vae = vae.to(_device, dtype=dtype)
+
+    # 5) грузим веса с фильтром по форме
     try:
         from safetensors.torch import load_file as _load_sf
         sd_full = _load_sf(w_path, device="cpu")
@@ -155,17 +161,21 @@ def _vae_build_diffusers(_device):
     sd = {k: v for k, v in sd_full.items() if k in ms and getattr(v, "shape", None) == getattr(ms[k], "shape", None)}
     missing = [k for k in ms.keys() if k not in sd]
     skipped = [k for k in sd_full.keys() if k not in sd]
-    vae.load_state_dict(sd, strict=False)
+
+    # в новых torch есть assign=True (вписывает тензоры без копирования), но оставим совместимым
+    try:
+        vae.load_state_dict(sd, strict=False, assign=True)
+    except TypeError:
+        vae.load_state_dict(sd, strict=False)
+
     print(f"[VAE] diffusers load ({'WAN' if _WAN else 'BASE'}) strict=False: loaded={len(sd)} missing={len(missing)} skipped(mismatch)={len(skipped)}")
 
-    # 4) dtype/device
-    vae = vae.to(_device, dtype=_torch.float16 if _device.type == "cuda" else _torch.float32)
     vae.eval().requires_grad_(False)
     return vae
 
-# monkey-patch: при USE_DIFFUSERS_VAE=1 подменяем __init__ найденного VAE-класса
+# monkey-patch: при USE_DIFFUSERS_VAE=1 подменяем __init__ обнаруженного VAE-класса
 if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
-    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE)")
+    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE) [to_empty]")
     _g = globals()
     _candidates = [k for k,v in _g.items() if _inspect.isclass(v) and "VAE" in k]
     for _name in _candidates:
@@ -179,12 +189,13 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
         print("[VAE] patched class:", _name)
         break
 '''
-if "Diffusers VAE backend (WAN/BASE class" not in s:
+if "backend (WAN if present, else BASE) [to_empty]" not in s:
     s = s + "\n" + append
 
 p.write_text(s, encoding="utf-8")
-print("patched (diffusers WAN/BASE backend)", p)
+print("patched (diffusers WAN/BASE backend + to_empty)", p)
 PY
+
 
 # ---------- APP ----------
 WORKDIR /app
