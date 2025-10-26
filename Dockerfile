@@ -92,51 +92,73 @@ p.write_text(s, encoding="utf-8")
 print("patched (filtered load)", p)
 PY
 
-# ---------- ПАТЧ №2: переключатель на diffusers VAE ----------
-# При USE_DIFFUSERS_VAE=1 вместо .pth загружается AutoencoderKLWan из HF.
+# ---------- ПАТЧ №2: diffusers VAE backend (robust, no strict) ----------
 RUN python3 - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
 append = r'''
-# ---- Diffusers VAE backend switch (monkey-patch) ----
+# ---- Robust Diffusers VAE backend (no strict state_dict) ----
 import os as _os
+import torch as _torch
+from huggingface_hub import hf_hub_download
+import json as _json
+
 try:
     from diffusers import AutoencoderKLWan as _DiffVAE
 except Exception:
     from diffusers import AutoencoderKL as _DiffVAE
-import torch as _torch
 
 def _vae_build_diffusers(_device):
-    return _DiffVAE.from_pretrained(
-        "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-        subfolder="vae",
-        torch_dtype=_torch.float16 if _device.type == "cuda" else _torch.float32
-    ).to(_device).eval().requires_grad_(False)
+    repo_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+    token = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    # 1) тянем config и веса напрямую
+    cfg_path = hf_hub_download(repo_id=repo_id, filename="vae/config.json", token=token)
+    w_path  = hf_hub_download(repo_id=repo_id, filename="vae/diffusion_pytorch_model.safetensors", token=token)
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = _json.load(f)
+    # 2) создаём модель по конфигу
+    vae = _DiffVAE.from_config(cfg)
+    # 3) грузим веса без строгих проверок
+    try:
+        from safetensors.torch import load_file as _load_sf
+        sd = _load_sf(w_path, device="cpu")
+    except Exception:
+        sd = _torch.load(w_path, map_location="cpu")
+    missing, unexpected = vae.load_state_dict(sd, strict=False)
+    print(f"[VAE] diffusers load (strict=False): missing={len(missing)} unexpected={len(unexpected)}")
+    # 4) перенос на нужное устройство/тип
+    vae = vae.to(_device, dtype=_torch.float16 if _device.type == "cuda" else _torch.float32)
+    vae.eval().requires_grad_(False)
+    return vae
 
+# monkey-patch: при USE_DIFFUSERS_VAE=1 подменяем инициализацию класса
+import inspect as _inspect
 if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
-    print("[VAE] Using diffusers VAE backend (monkey-patch)")
-    # Пытаемся подменить наиболее вероятные классы VAE
-    _globals = globals()
-    for _name in ["WANVAE2_1","WanVAE2_1","VAE2_1","VAE","Wan2_1_VAE","WanVAE","Wan_AE"]:
-        _cls = _globals.get(_name)
-        if _cls and hasattr(_cls, "__init__"):
-            _orig_init = _cls.__init__
-            def _init(self, *a, **kw):
-                _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
-                # просто создаём diffusers VAE и кладём в self.model
-                self.model = _vae_build_diffusers(_device)
-            _cls.__init__ = _init
-            print("[VAE] patched class:", _name)
-            break
+    print("[VAE] Using diffusers VAE backend (robust)")
+    _g = globals()
+    # найди класс VAE (имя может меняться между ревизиями)
+    _candidates = [k for k,v in _g.items() if _inspect.isclass(v) and "VAE" in k]
+    for _name in _candidates:
+        _cls = _g.get(_name)
+        if not _cls or not hasattr(_cls, "__init__"): 
+            continue
+        _orig_init = _cls.__init__
+        def _init(self, *a, **kw):
+            _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+            self.model = _vae_build_diffusers(_device)
+        _cls.__init__ = _init
+        print("[VAE] patched class:", _name)
+        break
 '''
-if "Diffusers VAE backend switch" not in s:
+if "Robust Diffusers VAE backend" not in s:
     s = s + "\n" + append
 
 p.write_text(s, encoding="utf-8")
-print("patched (diffusers backend switch)", p)
+print("patched (robust diffusers backend)", p)
 PY
+
 
 # ---------- APP ----------
 WORKDIR /app
