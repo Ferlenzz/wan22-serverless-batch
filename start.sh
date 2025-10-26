@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -e
 
+echo "[start] STARTING start.sh"
+
+# --- disable local .pth VAE if we use diffusers backend ---
+if [ "${USE_DIFFUSERS_VAE:-0}" = "1" ]; then
+  VDIR="${WAN_CKPT_DIR:-/runpod-volume/models/Wan2.2-TI2V-5B}"
+  if [ -f "$VDIR/Wan2.2_VAE.pth" ]; then
+    mv "$VDIR/Wan2.2_VAE.pth" "$VDIR/Wan2.2_VAE.pth.disabled" || true
+    echo "[start] disabled local VAE pth at $VDIR"
+  fi
+fi
+
 echo "[start] Patching Wan2.2 VAE backend if needed..."
 
 python3 - <<'PY'
@@ -111,26 +122,21 @@ def _vae_build_diffusers(_device):
 if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
     print("[VAE] Using diffusers VAE backend (WAN if present, else BASE) [to_empty|cpu-load|materialize|env]")
     _g = globals()
-    _candidates = [k for k,v in _g.items() if _inspect.isclass(v) and "VAE" in k]
-    for _name in _candidates:
-        _cls = _g.get(_name)
-        if not _cls or not hasattr(_cls, "__init__"):
-            continue
-        def _init(self, *a, **kw):
-            import torch.nn as _nn
-            try:
-                _nn.Module.__init__(self)
-            except Exception:
-                pass
-            _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
-            self.model = _vae_build_diffusers(_device)
-        _cls.__init__ = _init
-        print("[VAE] patched class:", _name)
-        break
+    # Patch ALL VAE-like classes
+    for _name, _cls in list(_g.items()):
+        if _inspect.isclass(_cls) and "VAE" in _name and hasattr(_cls, "__init__"):
+            def _init(self, *a, **kw):
+                import torch.nn as _nn
+                try: _nn.Module.__init__(self)
+                except Exception: pass
+                _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+                self.model = _vae_build_diffusers(_device)
+            _cls.__init__ = _init
+            print("[VAE] patched class:", _name)
 '''
     src = src + "\n" + append
 
-    # На всякий: если в коде был жёсткий repo_id — сделаем его ENV-driven
+    # Best-effort: make any hardcoded repo id env-driven
     src = re.sub(
         r'repo_id\s*=\s*"Wan-AI/Wan2\.2-TI2V-5B-Diffusers"',
         'repo_id = _os.environ.get("WAN_VAE_REPO", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")',
