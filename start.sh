@@ -12,7 +12,7 @@ if [ "${USE_DIFFUSERS_VAE:-0}" = "1" ]; then
   fi
 fi
 
-echo "[start] Patching Wan2.2 VAE backend if needed..."
+echo "[start] Patching Wan2.2 VAE backend (skip diffusers classes)..."
 
 python3 - <<'PY'
 import os, re
@@ -21,10 +21,10 @@ from pathlib import Path
 VAEP = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 src = VAEP.read_text(encoding="utf-8")
 
-MARKER = "[to_empty|cpu-load|materialize|env]"
+MARKER = "[to_empty|cpu-load|materialize|env|whitelist]"
 if MARKER not in src:
     append = r'''
-# ---- Diffusers VAE backend (WAN if available, else BASE) [to_empty|cpu-load|materialize|env] ----
+# ---- Diffusers VAE backend (WAN if available, else BASE) [to_empty|cpu-load|materialize|env|whitelist] ----
 import os as _os, inspect as _inspect
 import torch as _torch
 from huggingface_hub import hf_hub_download
@@ -120,19 +120,28 @@ def _vae_build_diffusers(_device):
     return vae
 
 if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
-    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE) [to_empty|cpu-load|materialize|env]")
+    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE) [to_empty|cpu-load|materialize|env|whitelist]")
     _g = globals()
-    # Patch ALL VAE-like classes
+    # Патчим только Wan-классы, не трогаем diffusers.*
+    WHITELIST = {"WanVAE_", "Wan2_1_VAE"}
     for _name, _cls in list(_g.items()):
-        if _inspect.isclass(_cls) and "VAE" in _name and hasattr(_cls, "__init__"):
-            def _init(self, *a, **kw):
-                import torch.nn as _nn
-                try: _nn.Module.__init__(self)
-                except Exception: pass
-                _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
-                self.model = _vae_build_diffusers(_device)
-            _cls.__init__ = _init
-            print("[VAE] patched class:", _name)
+        if not _inspect.isclass(_cls):
+            continue
+        mod = getattr(_cls, "__module__", "")
+        if mod.startswith("diffusers."):
+            continue
+        if _name not in WHITELIST:
+            continue
+        if not hasattr(_cls, "__init__"):
+            continue
+        def _init(self, *a, **kw):
+            import torch.nn as _nn, torch as _torch
+            try: _nn.Module.__init__(self)
+            except Exception: pass
+            _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+            self.model = _vae_build_diffusers(_device)
+        _cls.__init__ = _init
+        print("[VAE] patched class:", _name)
 '''
     src = src + "\n" + append
 
@@ -144,13 +153,12 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
     )
 
     VAEP.write_text(src, encoding="utf-8")
-    print("[patch] inserted diffusers VAE backend with ENV control")
+    print("[patch] inserted diffusers VAE backend with ENV control and whitelist")
 else:
     print("[patch] backend already present; skip")
-
 PY
 
-echo "[start] Runtime versions:"
+echo "[start] Runtime versions and env:"
 python3 - <<'PY'
 import os, torch
 try:
@@ -159,10 +167,8 @@ except Exception as e:
     dv = f"<not-importable: {e}>"
 print("[runtime] torch", torch.__version__)
 print("[runtime] diffusers", dv)
-print("[runtime] USE_DIFFUSERS_VAE =", os.environ.get("USE_DIFFUSERS_VAE"))
-print("[runtime] WAN_VAE_REPO     =", os.environ.get("WAN_VAE_REPO"))
-print("[runtime] WAN_VAE_SUBFOLDER=", os.environ.get("WAN_VAE_SUBFOLDER"))
-print("[runtime] WAN_VAE_FILENAME =", os.environ.get("WAN_VAE_FILENAME"))
+for k in ("USE_DIFFUSERS_VAE","WAN_VAE_REPO","WAN_VAE_SUBFOLDER","WAN_VAE_FILENAME"):
+    print(f"[env] {k} =", os.environ.get(k))
 PY
 
 echo "[start] Launching handler..."
