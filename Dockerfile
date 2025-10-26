@@ -68,7 +68,7 @@ import re
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
-helper = r"""
+helper = r'''
 def _load_filtered_state_dict(model, ckpt):
     ms = model.state_dict()
     ok, mism = {}, []
@@ -81,7 +81,7 @@ def _load_filtered_state_dict(model, ckpt):
     model.load_state_dict(ok, strict=False)
     print(f"[VAE] filtered load: loaded={len(ok)} missing={len(missing)} skipped(mismatch)={len(mism)}")
     return missing, mism
-"""
+'''
 if "def _load_filtered_state_dict" not in s:
     s = s.replace("import torch", "import torch\n" + helper, 1)
 
@@ -101,7 +101,9 @@ print("patched (filtered load)", p)
 PY
 
 # ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE) с корректной логикой переноса + материализацией на CPU ----------
-RUN python3 - <<'PY'
+# ломаем кеш слоёв при изменениях патча
+ARG PATCH_REV=3
+RUN echo "patch rev ${PATCH_REV}" && python3 - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
@@ -127,7 +129,7 @@ def _filter_kwargs_for_ctor(cfg: dict, cls):
     return {k: v for k, v in cfg.items() if k in allowed}
 
 def _materialize_on_cpu(module):
-    """Материализуем meta-параметры/буферы на CPU, чтобы .to(...) не падал."""
+    # Материализуем meta-параметры/буферы на CPU, чтобы .to(...) не падал.
     import torch.nn as _nn
     for name, p in list(module.named_parameters(recurse=True)):
         if getattr(p, "is_meta", False):
@@ -165,8 +167,7 @@ def _vae_build_diffusers(_device):
 
     # 4) режим выделения параметров:
     used_to_empty = False
-    has_to_empty = hasattr(vae, "to_empty")
-    if has_to_empty:
+    if hasattr(vae, "to_empty"):
         try:
             vae = vae.to_empty(_device, dtype=dtype)
             used_to_empty = True
@@ -225,7 +226,7 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
         _cls.__init__ = _init
         print("[VAE] patched class:", _name)
         break
-"""
+'''
 marker = "[to_empty|cpu-load|materialize]"
 if marker not in s:
     s = s + "\n" + append
