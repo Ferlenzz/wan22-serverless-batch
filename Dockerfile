@@ -5,7 +5,7 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DEFAULT_TIMEOUT=120
+    PIP_DEFAULT_TIMEOUT=180
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev ca-certificates \
@@ -26,7 +26,7 @@ WORKDIR /app
 RUN git clone https://github.com/Wan-Video/Wan2.2.git /app/Wan2.2
 
 WORKDIR /app/Wan2.2
-# Вырезаем flash-attn/xformers из requirements, чтобы ничего не компилировалось
+# Уберём flash-attn/xformers, чтобы ничего не компилировать
 RUN awk 'BEGIN{IGNORECASE=1} !/flash[-_]?attn/ && !/xformers/ {print}' requirements.txt > /tmp/req-pruned.txt
 RUN pip install -r /tmp/req-pruned.txt
 
@@ -41,26 +41,16 @@ COPY engine.py  /app/engine.py
 COPY .runpod/tests.json /app/.runpod/tests.json
 COPY .runpod/hub.json   /app/.runpod/hub.json
 
-# ---------- PY DEPS (утилиты) ----------
+# ---------- Утилиты / зависимость аудио ----------
 RUN python3 -m pip install --no-cache-dir \
       "pillow>=10" "imageio[ffmpeg]>=2.34" "numpy>=1.26" \
       "loguru>=0.7" "runpod==1.7.13" \
       "librosa>=0.10.2.post1" "einops>=0.7.0"
 
-# ---------- PEFT (c fallback) ----------
-# Сначала пробуем PyPI; если не вышло — ставим тот же релиз с GitHub.
-RUN python3 - << 'PY'
-import subprocess, sys
-def run(*args):
-    print(">>", " ".join(args)); sys.stdout.flush()
-    subprocess.check_call(args)
-try:
-    run(sys.executable, "-m", "pip", "install", "--no-cache-dir", "peft==0.18.0")
-except Exception as e:
-    print("PyPI peft install failed, falling back to GitHub:", e)
-    run(sys.executable, "-m", "pip", "install", "--no-cache-dir",
-        "git+https://github.com/huggingface/peft.git@v0.18.0")
-PY
+# ---------- ВАЖНО: peft >= 0.17.0 (ставим без зависимостей) ----------
+# Это удовлетворяет проверке diffusers `require_version("peft>=0.17.0")`
+# и не тянет лишние версии transformers/accelerate.
+RUN python3 -m pip install --no-cache-dir --no-deps "peft==0.18.0"
 
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
