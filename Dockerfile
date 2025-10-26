@@ -40,9 +40,20 @@ RUN pip install --no-cache-dir --prefer-binary \
       safetensors==0.4.5 einops==0.7.0 huggingface_hub==0.20.3
 
 # ---------- Diffusers / Transformers / PEFT ----------
+# сначала ставим как обычно...
 RUN pip install --no-cache-dir --prefer-binary \
       diffusers==0.31.0 transformers==4.44.2 accelerate==0.34.2 \
       peft==0.17.1
+# ... а затем ЖЁСТКО гарантируем нужную версию diffusers на рантайме
+RUN pip uninstall -y diffusers || true && \
+    pip install --no-cache-dir --prefer-binary --upgrade --force-reinstall diffusers==0.31.0
+# sanity-check на этапе сборки
+RUN python3 - <<'PY'
+import diffusers
+v = diffusers.__version__
+assert v.startswith("0.31."), f"diffusers version must be 0.31.x, got {v}"
+print("[check] diffusers", v)
+PY
 
 # ---------- AUDIO STACK (librosa и зависимости; всё в колёсах) ----------
 RUN pip install --no-cache-dir --prefer-binary \
@@ -170,6 +181,10 @@ WORKDIR /app
 COPY engine.py /app/engine.py
 COPY handler.py /app/handler.py
 
+# ---------- стартовый скрипт ----------
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
 ENV WAN_ROOT=/app/Wan2.2
@@ -190,4 +205,4 @@ ENV HF_ENABLE_HF_TRANSFER=
 ENV HF_HUB_ENABLE_HF_TRANSFER=
 
 # ---------- ENTRY ----------
-CMD ["python3","-u","/app/handler.py"]
+CMD ["/app/start.sh"]
