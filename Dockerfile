@@ -41,17 +41,26 @@ COPY engine.py  /app/engine.py
 COPY .runpod/tests.json /app/.runpod/tests.json
 COPY .runpod/hub.json   /app/.runpod/hub.json
 
-# ---------- PY DEPS (точечные) ----------
-# Минимально нужные утилиты
+# ---------- PY DEPS (утилиты) ----------
 RUN python3 -m pip install --no-cache-dir \
-      "pillow>=10" "imageio[ffmpeg]>=2.34" "numpy>=1.26" "loguru>=0.7" "runpod==1.7.13"
-
-# Фикс импорта аудио и тензорных операций
-RUN python3 -m pip install --no-cache-dir \
+      "pillow>=10" "imageio[ffmpeg]>=2.34" "numpy>=1.26" \
+      "loguru>=0.7" "runpod==1.7.13" \
       "librosa>=0.10.2.post1" "einops>=0.7.0"
 
-# ВАЖНО: поднять только версию peft, без перетягивания зависимостей (иначе начнутся конфликты)
-RUN python3 -m pip install --no-cache-dir --no-deps "peft==0.17.3"
+# ---------- PEFT (c fallback) ----------
+# Сначала пробуем PyPI; если не вышло — ставим тот же релиз с GitHub.
+RUN python3 - << 'PY'
+import subprocess, sys
+def run(*args):
+    print(">>", " ".join(args)); sys.stdout.flush()
+    subprocess.check_call(args)
+try:
+    run(sys.executable, "-m", "pip", "install", "--no-cache-dir", "peft==0.18.0")
+except Exception as e:
+    print("PyPI peft install failed, falling back to GitHub:", e)
+    run(sys.executable, "-m", "pip", "install", "--no-cache-dir",
+        "git+https://github.com/huggingface/peft.git@v0.18.0")
+PY
 
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
