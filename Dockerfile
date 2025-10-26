@@ -9,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev ca-certificates \
-    git ffmpeg libglib2.0-0 libgl1 curl libsndfile1 \
+    git curl ffmpeg libglib2.0-0 libgl1 libsndfile1 \
  && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install --upgrade pip setuptools wheel packaging
@@ -41,16 +41,18 @@ COPY engine.py  /app/engine.py
 COPY .runpod/tests.json /app/.runpod/tests.json
 COPY .runpod/hub.json   /app/.runpod/hub.json
 
-# ---------- Утилиты / зависимость аудио ----------
+# ---------- Утилиты / аудио / тензорные ----------
 RUN python3 -m pip install --no-cache-dir \
       "pillow>=10" "imageio[ffmpeg]>=2.34" "numpy>=1.26" \
       "loguru>=0.7" "runpod==1.7.13" \
       "librosa>=0.10.2.post1" "einops>=0.7.0"
 
-# ---------- ВАЖНО: peft >= 0.17.0 (ставим без зависимостей) ----------
-# Это удовлетворяет проверке diffusers `require_version("peft>=0.17.0")`
-# и не тянет лишние версии transformers/accelerate.
-RUN python3 -m pip install --no-cache-dir --no-deps "peft==0.18.0"
+# ---------- ВАЖНО: peft >= 0.17 для diffusers ----------
+# Ставим без зависимостей из zip архива GitHub через codeload (надёжно в CI).
+# Так мы удовлетворяем проверке версии в diffusers и не тянем лишние пакеты.
+RUN curl -L -o /tmp/peft-0.18.0.zip https://codeload.github.com/huggingface/peft/zip/refs/tags/v0.18.0 \
+ && python3 -m pip install --no-cache-dir --no-deps /tmp/peft-0.18.0.zip \
+ && rm -f /tmp/peft-0.18.0.zip
 
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
