@@ -143,9 +143,11 @@ def _vae_build_diffusers(_device):
 
     # 4) режим выделения параметров:
     #    - если есть to_empty -> выделяем на целевом девайсе и грузим веса туда
-    #    - если нет to_empty -> оставляем на CPU, грузим веса на CPU, и только ПОТОМ переносим .to(device, dtype)
+    #    - если нет to_empty -> МАТЕРИАЛИЗУЕМ на CPU (to_empty('cpu') если есть), грузим на CPU, и только ПОТОМ переносим .to(device, dtype)
     used_to_empty = False
-    if hasattr(vae, "to_empty"):
+    has_to_empty = hasattr(vae, "to_empty")
+
+    if has_to_empty:
         try:
             vae = vae.to_empty(_device, dtype=dtype)
             used_to_empty = True
@@ -163,6 +165,13 @@ def _vae_build_diffusers(_device):
     except Exception:
         sd_full = _torch.load(w_path, map_location="cpu")
 
+    # В CPU-ветке материализуем параметры на CPU до загрузки, чтобы не остались meta
+    if not used_to_empty and has_to_empty:
+        try:
+            vae = vae.to_empty("cpu")
+        except Exception:
+            pass
+
     ms = vae.state_dict()
     sd = {k: v for k, v in sd_full.items() if k in ms and getattr(v, "shape", None) == getattr(ms[k], "shape", None)}
     missing = [k for k in ms.keys() if k not in sd]
@@ -173,11 +182,10 @@ def _vae_build_diffusers(_device):
     except TypeError:
         vae.load_state_dict(sd, strict=False)
 
-    # 6) если не было to_empty (значит веса грузились на CPU) — переносим теперь
+    # 6) перенос после загрузки
     if not used_to_empty:
         vae = vae.to(_device, dtype=dtype)
     else:
-        # если to_empty было без dtype — доводим dtype
         try:
             vae = vae.to(dtype=dtype)
         except Exception:
@@ -202,14 +210,12 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
         print("[VAE] patched class:", _name)
         break
 '''
-# обновляем/вставляем блок
 marker = "backend (WAN if present, else BASE) [to_empty|cpu-load]"
 if marker not in s:
     s = s + "\n" + append
 p.write_text(s, encoding="utf-8")
 print("patched (diffusers WAN/BASE backend with cpu-load fallback)", p)
 PY
-
 
 # ---------- APP ----------
 WORKDIR /app
