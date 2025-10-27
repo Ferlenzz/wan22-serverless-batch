@@ -431,6 +431,90 @@ else:
 PYPATCH_BOUNDARY
 
 # -----------------------------------------------------------------------------
+# PERM PATCH: локальная boundary внутри generate() и безопасные сравнения (_bcond)
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PYPATCH_GEN_LOCAL'
+from pathlib import Path, re
+
+p = Path("/app/Wan2.2/wan/image2video.py")
+if not p.exists():
+    print("[patch][warn] not found:", p)
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # 1) Добавим хелперы, если их нет
+    if "_normalize_boundary_guarded" not in s:
+        s = s.replace(
+            "import os",
+            "import os\n\n"
+            "def _normalize_boundary_guarded(self):\n"
+            "    try:\n"
+            "        b = getattr(self, 'boundary', None)\n"
+            "        n = int(getattr(self, 'num_train_timesteps', 1000))\n"
+            "        if isinstance(b, dict) or hasattr(b, 'get'):\n"
+            "            if not b.get('enabled', False):\n"
+            "                return None\n"
+            "            lo = int(max(0, min(1, float(b.get('lower', 0.0)))) * n)\n"
+            "            up = int(max(0, min(1, float(b.get('upper', 1.0)))) * n)\n"
+            "            return (lo, up)\n"
+            "        if b is None:\n"
+            "            return None\n"
+            "        return int(float(b) * n) if isinstance(b, (int, float, str)) else None\n"
+            "    except Exception:\n"
+            "        return None\n\n"
+            "def _bcond(t, b):\n"
+            "    if b is None:\n"
+            "        return False\n"
+            "    if isinstance(b, tuple):\n"
+            "        try:\n"
+            "            lo, up = b\n"
+            "        except Exception:\n"
+            "            lo, up = 0, int(b[1]) if hasattr(b,'__len__') and len(b)>1 else 0\n"
+            "        return t.item() >= up\n"
+            "    try:\n"
+            "        return t.item() >= int(b)\n"
+            "    except Exception:\n"
+            "        return False\n",
+            1
+        )
+        changed = True
+
+    # 2) В начале generate(): boundary = _normalize_boundary_guarded(self)
+    s2 = re.sub(
+        r"(?ms)^(\s*def\s+generate\s*\(.*?\):\s*\n)(\s*)(\S)",
+        lambda m: f"{m.group(1)}{m.group(2)}boundary = _normalize_boundary_guarded(self)\n{m.group(2)}{m.group(3)}",
+        s
+    )
+    if s2 != s:
+        s = s2; changed = True
+
+    # 3) Тернарник sample_guide_scale ... if t.item() >= boundary ...
+    s2 = re.sub(
+        r"sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]",
+        "sample_guide_scale = guide_scale[1] if _bcond(t, boundary) else guide_scale[0]",
+        s
+    )
+    if s2 != s:
+        s = s2; changed = True
+
+    # 4) Любые if t.item() >= boundary:
+    s2 = re.sub(
+        r"(?m)^(?P<ind>\s*)if\s+t\.item\(\)\s*>=\s*boundary\s*:\s*$",
+        lambda m: f"{m.group('ind')}if _bcond(t, boundary):",
+        s
+    )
+    if s2 != s:
+        s = s2; changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: generate() local boundary normalized + safe compares")
+    else:
+        print("[patch] image2video.py: generate() already patched")
+PYPATCH_GEN_LOCAL
+
+# -----------------------------------------------------------------------------
 # Запуск хэндлера
 # -----------------------------------------------------------------------------
 echo "[start] Launching handler..."
