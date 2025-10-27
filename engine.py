@@ -6,10 +6,10 @@ import sys
 from typing import Dict, Any, Optional
 from pathlib import Path
 
-# --- чтобы интерпретатор видел /app/Wan2.2 ---
-WAN_ROOT = os.environ.get("WAN_ROOT", "/app/Wan2.2")
-if os.path.isdir(WAN_ROOT) and WAN_ROOT not in sys.path:
-    sys.path.insert(0, WAN_ROOT)
+# --- ensure interpreter sees /app and /app/Wan2.2 (container env may already set) ---
+for p in ("/app", "/app/Wan2.2"):
+    if os.path.isdir(p) and p not in sys.path:
+        sys.path.insert(0, p)
 
 from loguru import logger
 from PIL import Image
@@ -20,7 +20,7 @@ import imageio
 from wan.configs.wan_ti2v_5B import ti2v_5B as cfg
 from wan.image2video import WanI2V
 
-# --- EasyDict совместимость ---
+# --- EasyDict compatibility ---
 try:
     from easydict import EasyDict as EDict
 except Exception:
@@ -28,7 +28,7 @@ except Exception:
         __getattr__ = dict.get
         __setattr__ = dict.__setitem__
 
-# ----- пути -----
+# ----- paths -----
 RP_VOLUME   = Path(os.environ.get("RP_VOLUME", "/runpod-volume"))
 CKPT_DIR    = Path(os.environ.get("WAN_CKPT_DIR", RP_VOLUME / "models" / "Wan2.2-TI2V-5B"))
 RESULTS_DIR = RP_VOLUME / "results"
@@ -38,37 +38,30 @@ for d in (RESULTS_DIR, LAST_IMG_DIR):
 
 _MODEL: Optional[WanI2V] = None
 
-
 # ================= helpers =================
 def _ensure_cfg():
-    """
-    Берём конфиг ti2v_5B как объект и добавляем недостающие поля.
-    В некоторых ревизиях у config отсутствует `boundary` — добавляем дефолт.
-    """
+    \"\"\"Take ti2v_5B config and normalize missing fields.\"\"\"
     c = cfg() if callable(cfg) else cfg
 
-    # гарантируем наличие блока boundary
+    # guarantee boundary block presence
     if not hasattr(c, "boundary") or c.boundary is None:
         c.boundary = EDict({
-            "enabled": False,   # отключено по умолчанию
+            "enabled": False,
             "lower": 0.0,
             "upper": 1.0,
         })
     else:
-        # нормализуем ключ к 'enabled'
+        # normalize key name enable -> enabled
         if isinstance(c.boundary, dict):
             if "enable" in c.boundary and "enabled" not in c.boundary:
                 c.boundary["enabled"] = bool(c.boundary.get("enable"))
         else:
-            # объект с атрибутами
             if hasattr(c.boundary, "enable") and not hasattr(c.boundary, "enabled"):
                 try:
                     c.boundary.enabled = bool(getattr(c.boundary, "enable"))
                 except Exception:
                     pass
-
     return c
-
 
 def _load_model() -> WanI2V:
     global _MODEL
@@ -79,84 +72,91 @@ def _load_model() -> WanI2V:
         logger.info("WanI2V ready.")
     return _MODEL
 
-
 def _b64_to_image(b64: str) -> Image.Image:
-    if "," in b64:
-        b64 = b64.split(",", 1)[1]
+    if \",\" in b64:
+        b64 = b64.split(\",\", 1)[1]
     raw = base64.b64decode(b64)
-    return Image.open(io.BytesIO(raw)).convert("RGB")
-
+    return Image.open(io.BytesIO(raw)).convert(\"RGB\")
 
 def _save_last_image(user_id: str, im: Image.Image) -> str:
-    p = LAST_IMG_DIR / f"{user_id}.png"
-    im.save(p, format="PNG")
+    p = LAST_IMG_DIR / f\"{user_id}.png\"
+    im.save(p, format=\"PNG\")
     return str(p)
 
-
 def _load_last_image(user_id: str) -> Optional[Image.Image]:
-    p = LAST_IMG_DIR / f"{user_id}.png"
+    p = LAST_IMG_DIR / f\"{user_id}.png\"
     if p.exists():
-        return Image.open(p).convert("RGB")
+        return Image.open(p).convert(\"RGB\")
     return None
 
-
 def _arr_to_mp4_and_b64(arr: np.ndarray, out_path: Path, fps: int = 24) -> str:
-    """
-    arr: (T,H,W,3) uint8
-    сохраняет в out_path и возвращает data:video/mp4;base64,...
-    """
+    \"\"\"arr: (T,H,W,3) uint8 -> save to out_path and return data:video/mp4;base64,...\"\"\"
     imageio.mimsave(out_path, arr, fps=fps, macro_block_size=None)
-    with open(out_path, "rb") as f:
-        return "data:video/mp4;base64," + base64.b64encode(f.read()).decode()
+    with open(out_path, \"rb\") as f:
+        return \"data:video/mp4;base64,\" + base64.b64encode(f.read()).decode()
 
+# ---- safe callable resolver for WanI2V (works even if class has no __call__) ----
+def _get_wan_call(obj):
+    call = getattr(obj, \"__call__\", None)
+    if callable(call):
+        return call
+    for name in (\"generate\",\"infer\",\"forward\",\"run\",\"predict\",\"sample\"):
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            return fn
+    raise TypeError(\"WanI2V is not callable and no known generate method found\")
+
+class _WanI2VProxy:
+    def __init__(self, obj): self._obj = obj
+    def __getattr__(self, n): return getattr(self._obj, n)
+    def __call__(self, *a, **k):
+        return _get_wan_call(self._obj)(*a, **k)
+
+def _wrap_wani2v(obj): return _WanI2VProxy(obj)
 
 # ================ public API =================
 def warmup() -> Dict[str, Any]:
-    """
-    Ленивая инициализация модели — подтянет веса и прогреет пайплайн.
-    """
     _ = _load_model()
-    return {"ok": True, "message": "model initialized"}
-
+    return {\"ok\": True, \"message\": \"model initialized\"}
 
 def generate_one(inp: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ожидает в inp:
-      - prompt: str (опционально)
-      - image_base64: data-url или чистый base64  (или use_last=True + user_id)
+    \"\"\"Generate a short video from an input image.
+    Expects in inp:
+      - prompt: str (optional)
+      - image_base64: data-url or raw base64 (or use_last=True + user_id)
       - width,height,steps,cfg,length (frames)
-    Возвращает:
+    Returns:
       - video_b64, path, seconds, last_image_path
-    """
-    m = _load_model()
+    \"\"\"
+    m = _wrap_wani2v(_load_model())
 
-    user_id  = str(inp.get("user_id", "u1"))
-    use_last = bool(inp.get("use_last", False))
-    prompt   = str(inp.get("prompt", ""))
+    user_id  = str(inp.get(\"user_id\", \"u1\"))
+    use_last = bool(inp.get(\"use_last\", False))
+    prompt   = str(inp.get(\"prompt\", \"\"))
 
-    # входное изображение
+    # input image
     img: Optional[Image.Image] = None
-    b64 = (inp.get("image_base64") or "").strip()
+    b64 = (inp.get(\"image_base64\") or \"\").strip()
     if b64:
         img = _b64_to_image(b64)
         _save_last_image(user_id, img)
     elif use_last:
         img = _load_last_image(user_id)
         if img is None:
-            raise RuntimeError("use_last=True but no previous image found; send image_base64 first.")
+            raise RuntimeError(\"use_last=True but no previous image found; send image_base64 first.\")
     else:
-        raise RuntimeError("No image provided. Send image_base64 or set use_last=true after previous call.")
+        raise RuntimeError(\"No image provided. Send image_base64 or set use_last=true after previous call.\")
 
-    width      = int(inp.get("width", 480))
-    height     = int(inp.get("height", 832))
-    steps      = int(inp.get("steps", 10))
-    cfg_scale  = float(inp.get("cfg", 2.0))
-    frame_num  = int(inp.get("length", 81))
-    fps        = int(inp.get("fps", 24))
+    width      = int(inp.get(\"width\", 480))
+    height     = int(inp.get(\"height\", 832))
+    steps      = int(inp.get(\"steps\", 10))
+    cfg_scale  = float(inp.get(\"cfg\", 2.0))
+    frame_num  = int(inp.get(\"length\", 81))
+    fps        = int(inp.get(\"fps\", 24))
 
     t0 = time.time()
-    # WanI2V ожидает PIL.Image, возвращает список/np массив кадров (T,H,W,3) uint8
-    frames = m(
+    # Call via resolver — works for any available generation method
+    frames = _get_wan_call(m)(
         img=img,
         prompt=prompt,
         width=width,
@@ -167,21 +167,21 @@ def generate_one(inp: Dict[str, Any]) -> Dict[str, Any]:
     )
     secs = time.time() - t0
 
-    # нормализуем в np.ndarray (T,H,W,3) uint8
+    # normalize to np.ndarray (T,H,W,3) uint8
     if isinstance(frames, (list, tuple)):
         arr = np.stack(frames, axis=0)
     else:
         arr = np.asarray(frames)
-    if arr.ndim == 3:  # (T,H,W) -> (T,H,W,1) -> broadcast до 3 каналов при записи
+    if arr.ndim == 3:  # (T,H,W) -> (T,H,W,1)
         arr = arr[..., None]
     arr = arr.astype(np.uint8)
 
-    out_path = RESULTS_DIR / f"wan22_{int(time.time())}.mp4"
+    out_path = RESULTS_DIR / f\"wan22_{int(time.time())}.mp4\"
     video_b64 = _arr_to_mp4_and_b64(arr, out_path, fps=fps)
 
     return {
-        "video_b64": video_b64,
-        "path": str(out_path),
-        "seconds": round(secs, 3),
-        "last_image_path": str(LAST_IMG_DIR / f"{user_id}.png"),
+        \"video_b64\": video_b64,
+        \"path\": str(out_path),
+        \"seconds\": round(secs, 3),
+        \"last_image_path\": str(LAST_IMG_DIR / f\"{user_id}.png\"),
     }
