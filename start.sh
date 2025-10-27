@@ -292,6 +292,51 @@ else:
         print("[patch] vae2_1.py: encode() patch not applied (pattern not found) — maybe already patched?")
 PYPATCH_ENCODE
 
+# -----------------------------------------------------------------------------
+# image2video.py: поддержка boundary как dict (enabled/low/upper) и как числа
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PYPATCH_BOUNDARY'
+from pathlib import Path, re
+
+p = Path("/app/Wan2.2/wan/image2video.py")
+if not p.exists():
+    print("[patch][warn] not found:", p)
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # 1) Нормализуем вычисление boundary: dict -> (lo_idx, up_idx) | None; число -> int(...)
+    # Ищем строку вида: boundary = self.boundary * self.num_train_timesteps
+    pat = re.compile(r"^\s*boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$", re.M)
+    if pat.search(s):
+        s = pat.sub(
+            (
+                "    # normalize boundary (dict or scalar)\n"
+                "    _b = self.boundary\n"
+                "    _n = self.num_train_timesteps\n"
+                "    if isinstance(_b, dict) or hasattr(_b, 'get'):\n"
+                "        if not (_b.get('enabled', False)):\n"
+                "            boundary = None\n"
+                "        else:\n"
+                "            _lo = int(max(0, min(1, float(_b.get('lower', 0.0)))) * _n)\n"
+                "            _up = int(max(0, min(1, float(_b.get('upper', 1.0)))) * _n)\n"
+                "            boundary = (_lo, _up)\n"
+                "    else:\n"
+                "        try:\n"
+                "            boundary = int(float(_b) * _n)\n"
+                "        except Exception:\n"
+                "            boundary = None\n"
+            ),
+            s
+        )
+        changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: boundary handling normalized (dict/scalar)")
+    else:
+        print("[patch] image2video.py: boundary patch not applied (pattern not found) — maybe already patched?")
+PYPATCH_BOUNDARY
 
 # -----------------------------------------------------------------------------
 # Запуск хэндлера
