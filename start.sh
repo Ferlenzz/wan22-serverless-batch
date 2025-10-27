@@ -199,20 +199,62 @@ else:
         print("[guard] target .pth load line not found — maybe already patched")
 PY
 
-# --- ensure 'import os' in vae2_1.py (needed for USE_DIFFUSERS_VAE env check)
+# --- ensure 'import os' and guard native .pth load ---
 python3 - <<'PY'
 from pathlib import Path
+import re
+
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
-if p.exists():
-    s = p.read_text(encoding="utf-8")
-    if "import os" not in s:
-        s = s.replace("import torch", "import torch\nimport os", 1)
-        p.write_text(s, encoding="utf-8")
-        print("[start][patch] added 'import os' to vae2_1.py")
-    else:
-        print("[start][patch] 'import os' already present")
+if not p.exists():
+    print("[guard][warn] file not found:", p)
 else:
-    print("[start][patch][warn] vae2_1.py not found at", p)
+    s = p.read_text(encoding="utf-8")
+
+    # 1) гарантируем import os сразу после первого import torch
+    if "import os" not in s.split("\n", 40):  # смотрим только верх файла
+        s = s.replace("import torch", "import torch\nimport os", 1)
+        print("[guard] injected 'import os' after 'import torch'")
+
+    # 2) жёсткий гард вокруг model.load_state_dict(torch.load(...pretrained_path...))
+    #    если USE_DIFFUSERS_VAE=1 ИЛИ файла нет — пропускаем torch.load
+    pat = re.compile(
+        r'^(?P<ind>\s*)missing,\s*mism\s*=\s*_load_filtered_state_dict\(\s*model,\s*torch\.load\(\s*pretrained_path.*$',
+        re.M
+    )
+    def repl(m):
+        ind  = m.group('ind')
+        code = (
+            f"{ind}if os.environ.get('USE_DIFFUSERS_VAE','0') == '1' or not os.path.isfile(pretrained_path):\n"
+            f"{ind}    print('[VAE] skip native .pth load (env=USE_DIFFUSERS_VAE or missing file):', pretrained_path)\n"
+            f"{ind}else:\n"
+            f"{ind}    missing, mism = _load_filtered_state_dict(model, torch.load(pretrained_path, map_location=device))"
+        )
+        return code
+
+    s2 = pat.sub(repl, s)
+    if s2 != s:
+        p.write_text(s2, encoding="utf-8")
+        print("[guard] wrapped native .pth load in", p)
+    else:
+        # запасной паттерн, если строка без нашего _load_filtered_state_dict(...)
+        pat2 = re.compile(
+            r'^(?P<ind>\s*)model\.load_state_dict\(\s*torch\.load\(\s*pretrained_path.*$',
+            re.M
+        )
+        def repl2(m):
+            ind  = m.group('ind')
+            return (
+                f"{ind}if os.environ.get('USE_DIFFUSERS_VAE','0') == '1' or not os.path.isfile(pretrained_path):\n"
+                f"{ind}    print('[VAE] skip native .pth load (env=USE_DIFFUSERS_VAE or missing file):', pretrained_path)\n"
+                f"{ind}else:\n"
+                f"{ind}    " + m.group(0).strip()
+            )
+        s3 = pat2.sub(repl2, s)
+        if s3 != s:
+            p.write_text(s3, encoding="utf-8")
+            print("[guard] wrapped model.load_state_dict(torch.load(...)) in", p)
+        else:
+            print("[guard] target .pth load not found — возможно уже пропатчено")
 PY
 
 echo "[start] Launching handler..."
