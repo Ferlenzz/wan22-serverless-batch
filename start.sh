@@ -563,6 +563,63 @@ else:
         print("[patch] image2video.py: no boundary compare/ternary patterns found (maybe already patched)")
 PYPATCH_BREWRITE
 
+# --- image2video.py: нормализация латентов до 48 каналов (безопасный слой)
+${PYBIN} - <<'PY'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/image2video.py")
+if p.exists():
+    s = p.read_text(encoding="utf-8")
+    changed = False
+    if "_ensure_ch48" not in s:
+        s = s.replace(
+            "import os",
+            "import os\n\n"
+            "def _ensure_ch48(u):\n"
+            "    import torch\n"
+            "    if u.dim() == 5:\n"
+            "        B,C,T,H,W = u.shape\n"
+            "        if C == 48: return u\n"
+            "        if T == 48 and C != 48: return u.permute(0,2,1,3,4)\n"
+            "        if C > 48: return u[:, :48]\n"
+            "        if C < 48:\n"
+            "            reps = (48 + C - 1)//C\n"
+            "            return u.repeat(1, reps, 1, 1, 1)[:, :48]\n"
+            "        return u\n"
+            "    elif u.dim() == 4:\n"
+            "        C,T,H,W = u.shape\n"
+            "        if C == 48: return u\n"
+            "        if T == 48 and C != 48: return u.permute(1,0,2,3)\n"
+            "        if C > 48: return u[:48]\n"
+            "        if C < 48:\n"
+            "            reps = (48 + C - 1)//C\n"
+            "            return u.repeat(reps, 1, 1, 1)[:48]\n"
+            "        return u\n"
+            "    return u\n",
+            1
+        )
+        changed = True
+
+    # В generate перед вызовом модели нормализуем x
+    s2 = re.sub(
+        r"noise_pred_cond\s*=\s*model\(",
+        "    x = [ _ensure_ch48(u) for u in x ]\n"
+        "    noise_pred_cond = model(",
+        s, count=1
+    )
+    if s2 != s:
+        s = s2
+        changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: _ensure_ch48 in place and applied")
+    else:
+        print("[patch] image2video.py: ch48 patch already present")
+else:
+    print("[patch][warn] image2video.py not found")
+PY
+
+
 # -----------------------------------------------------------------------------
 # Запуск хэндлера
 # -----------------------------------------------------------------------------
