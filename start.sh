@@ -357,6 +357,58 @@ else:
 PYPATCH_BOUNDARY
 
 # -----------------------------------------------------------------------------
+# image2video.py: безопасное сравнение с boundary (может быть None | int | tuple)
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PYPATCH_BOUNDARY_CMP'
+from pathlib import Path
+import re
+
+p = Path("/app/Wan2.2/wan/image2video.py")
+if not p.exists():
+    print("[patch][warn] not found:", p)
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # Ищем условие вида: if t.item() >= boundary:
+    pat = re.compile(r'^(?P<ind>\s*)if\s+t\.item\(\)\s*>=\s*boundary\s*:\s*$', re.M)
+
+    def repl(m):
+        ind  = m.group('ind')
+        ind1 = ind + "    "
+        return (
+            f"{ind}# safe compare with boundary that may be None | int | (lo, up)\n"
+            f"{ind}_b = boundary\n"
+            f"{ind}if _b is None:\n"
+            f"{ind1}_cond = False\n"
+            f"{ind}elif isinstance(_b, tuple):\n"
+            f"{ind1}try:\n"
+            f"{ind1}    _lo, _up = _b\n"
+            f"{ind1}except Exception:\n"
+            f"{ind1}    _lo, _up = 0, int(_b[1]) if len(_b)>1 else 0\n"
+            f"{ind1}_cond = (t.item() >= _up)\n"
+            f"{ind}else:\n"
+            f"{ind1}try:\n"
+            f"{ind1}    _cond = (t.item() >= int(_b))\n"
+            f"{ind1}except Exception:\n"
+            f"{ind1}    _cond = False\n"
+            f"{ind}if _cond:"
+        )
+
+    s2 = pat.sub(repl, s)
+    if s2 != s:
+        s = s2
+        changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: safe boundary comparison applied")
+    else:
+        print("[patch] image2video.py: comparison patch not applied (pattern not found) — maybe already patched?")
+PYPATCH_BOUNDARY_CMP
+
+
+# -----------------------------------------------------------------------------
 # Запуск хэндлера
 # -----------------------------------------------------------------------------
 echo "[start] Launching handler..."
