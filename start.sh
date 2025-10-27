@@ -147,6 +147,26 @@ p.write_text(s, encoding="utf-8")
 print("[patch] vae2_1.py saved")
 PYPATCH1
 
+# --- ensure _video_vae imports os locally (robust)
+${PYBIN} - <<'PY'
+from pathlib import Path
+import re
+p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
+s = p.read_text(encoding="utf-8")
+if "def _video_vae(*_args, **_kwargs):" in s and "import os as __os" not in s:
+    s = s.replace(
+        "def _video_vae(*_args, **_kwargs):",
+        "def _video_vae(*_args, **_kwargs):\n    import os as __os\n    import torch as __torch"
+    )
+    s = s.replace("if os.environ.get('USE_DIFFUSERS_VAE','0') == '1':",
+                  "if __os.environ.get('USE_DIFFUSERS_VAE','0') == '1':")
+    p.write_text(s, encoding="utf-8")
+    print("[start][patch] made _video_vae import os locally")
+else:
+    print("[start][patch] _video_vae already robust or not found")
+PY
+
+
 # --- ensure 'import os' at very top of vae2_1.py (robust)
 python3 - <<'PY'
 from pathlib import Path
