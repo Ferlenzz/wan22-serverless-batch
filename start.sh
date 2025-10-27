@@ -91,7 +91,7 @@ def _filter_kwargs_for_ctor(cfg: dict, cls):
     return {k: v for k, v in cfg.items() if k in allowed}
 
 def _materialize_on_cpu(module):
-    \"\"\"Instantiate meta-parameters/buffers on CPU so .to(...) does not crash.\"\"\"
+    """Instantiate meta-parameters/buffers on CPU so .to(...) does not crash."""
     import torch.nn as _nn
     for name, p in list(module.named_parameters(recurse=True)):
         if getattr(p, "is_meta", False):
