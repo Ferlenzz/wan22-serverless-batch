@@ -5,6 +5,7 @@ import base64
 import sys
 from typing import Dict, Any, Optional
 from pathlib import Path
+from inspect import signature, Parameter
 
 # --- ensure interpreter sees /app and /app/Wan2.2 ---
 for p in ("/app", "/app/Wan2.2"):
@@ -95,7 +96,7 @@ def _arr_to_mp4_and_b64(arr: np.ndarray, out_path: Path, fps: int = 24) -> str:
     with open(out_path, "rb") as f:
         return "data:video/mp4;base64," + base64.b64encode(f.read()).decode()
 
-# ---- safe callable resolver for WanI2V ----
+# ---- make WanI2V safely callable ----
 def _get_wan_call(obj):
     call = getattr(obj, "__call__", None)
     if callable(call):
@@ -106,10 +107,73 @@ def _get_wan_call(obj):
             return fn
     raise TypeError("WanI2V is not callable and no known generate method found")
 
+def _filter_and_remap_kwargs(fn, kw: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only params supported by fn; remap common aliases."""
+    sig = signature(fn)
+    params = sig.parameters
+
+    def has(name: str) -> bool:
+        return name in params and params[name].kind in (
+            Parameter.POSITIONAL_OR_KEYWORD,
+            Parameter.KEYWORD_ONLY
+        )
+
+    out = {}
+
+    # image arg
+    if "img" in kw or "image" in kw:
+        v = kw.get("img", kw.get("image"))
+        out["image" if has("image") else ("img" if has("img") else None)] = v
+
+    # width/height
+    for k in ("width","height"):
+        if k in kw and has(k):
+            out[k] = kw[k]
+
+    # steps
+    if "steps" in kw:
+        if has("steps"):
+            out["steps"] = kw["steps"]
+        elif has("num_inference_steps"):
+            out["num_inference_steps"] = kw["steps"]
+
+    # guidance scale (cfg)
+    if "guidance_scale" in kw or "cfg" in kw or "cfg_scale" in kw:
+        v = kw.get("guidance_scale", kw.get("cfg", kw.get("cfg_scale")))
+        if has("guidance_scale"):
+            out["guidance_scale"] = v
+        elif has("scale"):
+            out["scale"] = v
+
+    # frames / length
+    if "frame_num" in kw or "length" in kw or "frames" in kw or "num_frames" in kw:
+        v = kw.get("frame_num", kw.get("length", kw.get("frames", kw.get("num_frames"))))
+        for name in ("frame_num","num_frames","frames","length"):
+            if has(name):
+                out[name] = v
+                break
+
+    # prompt — только если поддерживается
+    if "prompt" in kw and has("prompt"):
+        out["prompt"] = kw["prompt"]
+
+    # fps — если поддерживается
+    if "fps" in kw and has("fps"):
+        out["fps"] = kw["fps"]
+
+    # фильтруем None ключ (если image/img оба не поддерживаются)
+    out = {k:v for k,v in out.items() if k is not None}
+    return out
+
+def _invoke_wan(obj, **kw):
+    fn = _get_wan_call(obj)
+    filtered = _filter_and_remap_kwargs(fn, kw)
+    return fn(**filtered)
+
 class _WanI2VProxy:
     def __init__(self, obj): self._obj = obj
     def __getattr__(self, n): return getattr(self._obj, n)
-    def __call__(self, *a, **k): return _get_wan_call(self._obj)(*a, **k)
+    def __call__(self, *a, **k): return _invoke_wan(self._obj, **k)
 
 def _wrap_wani2v(obj): return _WanI2VProxy(obj)
 
@@ -147,14 +211,16 @@ def generate_one(inp: Dict[str, Any]) -> Dict[str, Any]:
     fps        = int(inp.get("fps", 24))
 
     t0 = time.time()
-    frames = _get_wan_call(m)(
+    frames = _invoke_wan(
+        m,
         img=img,
         prompt=prompt,
         width=width,
         height=height,
         steps=steps,
         guidance_scale=cfg_scale,
-        frame_num=frame_num
+        frame_num=frame_num,
+        fps=fps,
     )
     secs = time.time() - t0
 
