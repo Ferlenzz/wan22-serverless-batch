@@ -242,6 +242,58 @@ else:
 PYPATCH_NOISE
 
 # -----------------------------------------------------------------------------
+# vae2_1.py: совместимость с diffusers AutoencoderKLOutput в encode()
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PYPATCH_ENCODE'
+from pathlib import Path, re
+
+p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
+if not p.exists():
+    print("[patch][warn] not found:", p)
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # Найдём место, где внутри encode() делается ... self.model.encode(...).float().squeeze(0)
+    # и заменим на логику распаковки AutoencoderKLOutput.
+    pat = re.compile(
+        r"""(self\.model\.encode\(\s*u\.unsqueeze\(0\)\s*,\s*self\.scale\s*\)\.float\(\)\.squeeze\(0\))""",
+        re.VERBOSE
+    )
+    if pat.search(s):
+        s = pat.sub(
+            "(_out := self.model.encode(u.unsqueeze(0), self.scale), "
+            "_tmp := (getattr(_out, 'latent_dist', None).mode() if getattr(_out, 'latent_dist', None) is not None "
+            "else (getattr(_out, 'latents', None) if getattr(_out, 'latents', None) is not None else _out)), "
+            "_tmp.float().squeeze(0))[-1]",
+            s
+        )
+        changed = True
+    else:
+        # запасной вариант — если без .squeeze(0) или формат чуть другой
+        pat2 = re.compile(
+            r"""(self\.model\.encode\(\s*u\.unsqueeze\(0\)\s*,\s*self\.scale\s*\)\.float\(\))""",
+            re.VERBOSE
+        )
+        if pat2.search(s):
+            s = pat2.sub(
+                "(_out := self.model.encode(u.unsqueeze(0), self.scale), "
+                "_tmp := (getattr(_out, 'latent_dist', None).mode() if getattr(_out, 'latent_dist', None) is not None "
+                "else (getattr(_out, 'latents', None) if getattr(_out, 'latents', None) is not None else _out)), "
+                "_tmp.float())[-1]",
+                s
+            )
+            changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] vae2_1.py: encode() now unwraps AutoencoderKLOutput")
+    else:
+        print("[patch] vae2_1.py: encode() patch not applied (pattern not found) — maybe already patched?")
+PYPATCH_ENCODE
+
+
+# -----------------------------------------------------------------------------
 # Запуск хэндлера
 # -----------------------------------------------------------------------------
 echo "[start] Launching handler..."
