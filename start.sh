@@ -1,4 +1,3 @@
-# start.sh
 #!/usr/bin/env bash
 set -Eeuo pipefail
 trap 'echo "[start][fatal] exit $?: at line $LINENO"; tail -n +1 -v /app/start.sh | nl | sed -n "$((LINENO-5)),$((LINENO+5))p"' ERR
@@ -16,7 +15,7 @@ except Exception as e:
     print("[runtime] torch not importable:", e)
 PYINFO
 
-# --- ensure diffusers >= 0.33
+# --- ensure diffusers >= 0.33 (WAN support)
 python3 - <<'PYDIF'
 import subprocess, sys
 def run(*args): subprocess.check_call([sys.executable, "-m", "pip", *args])
@@ -62,7 +61,7 @@ if [ "${USE_DIFFUSERS_VAE:-0}" = "1" ]; then
   fi
 fi
 
-# --- write separate patch script to avoid heredoc quoting issues
+# --- backend-injection patch (separate script)
 cat >/tmp/patch_vae.py <<'PY'
 from pathlib import Path
 import os, importlib, inspect
@@ -168,6 +167,32 @@ apply_patch()
 PY
 
 python3 /tmp/patch_vae.py
+
+# --- guard native .pth load in vae2_1.py when using diffusers VAE or file missing
+python3 - <<'PY'
+from pathlib import Path
+import re, os
+p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
+if not p.exists():
+    print("[guard][warn] file not found:", p)
+else:
+    s = p.read_text(encoding="utf-8")
+    if "import os" not in s:
+        s = s.replace("import torch", "import torch\nimport os", 1)
+    pattern = r"""missing,\s*mism\s*=\s*_load_filtered_state_dict\(\s*model\s*,\s*torch\.load\(\s*pretrained_path\s*,\s*map_location\s*=\s*device\s*\)\s*\)"""
+    guard = (
+        "if os.environ.get('USE_DIFFUSERS_VAE','0')=='1' or not os.path.isfile(pretrained_path):\n"
+        "    print(f\"[VAE] skip .pth load (USE_DIFFUSERS_VAE or missing file): {pretrained_path}\")\n"
+        "else:\n"
+        "    missing, mism = _load_filtered_state_dict(model, torch.load(pretrained_path, map_location=device))"
+    )
+    s2, n = re.subn(pattern, guard, s)
+    if n > 0:
+        p.write_text(s2, encoding="utf-8")
+        print(f"[guard] wrapped .pth load in {p} (occurrences: {n})")
+    else:
+        print("[guard] target .pth load line not found — maybe already patched")
+PY
 
 echo "[start] Launching handler..."
 exec python3 -u /app/handler.py
