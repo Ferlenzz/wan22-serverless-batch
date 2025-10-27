@@ -3,7 +3,25 @@ set -e
 
 echo "[start] STARTING start.sh"
 
-# --- disable local .pth VAE if we use diffusers backend ---
+python3 - <<'PY'
+import sys, subprocess
+from packaging.version import Version
+try:
+    import diffusers
+    cur = diffusers.__version__
+except Exception as e:
+    print("[start][fix] diffusers not importable:", e)
+    cur = "0.0.0"
+
+if Version(cur) < Version("0.33.0"):
+    print(f"[start][fix] upgrading diffusers (was {cur}) to >=0.33.0 ...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "--upgrade", "--force-reinstall", "diffusers>=0.33.0"])
+    import importlib, diffusers as _d; importlib.reload(_d)
+    print("[start][fix] diffusers now", _d.__version__)
+else:
+    print("[start][fix] diffusers already", cur)
+PY
+
 if [ "${USE_DIFFUSERS_VAE:-0}" = "1" ]; then
   VDIR="${WAN_CKPT_DIR:-/runpod-volume/models/Wan2.2-TI2V-5B}"
   if [ -f "$VDIR/Wan2.2_VAE.pth" ]; then
@@ -12,7 +30,7 @@ if [ "${USE_DIFFUSERS_VAE:-0}" = "1" ]; then
   fi
 fi
 
-echo "[start] Patching Wan2.2 VAE backend (skip diffusers classes)..."
+echo "[start] Patching Wan2.2 VAE backend (skip diffusers classes)..."\
 
 python3 - <<'PY'
 import os, re
@@ -21,21 +39,33 @@ from pathlib import Path
 VAEP = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 src = VAEP.read_text(encoding="utf-8")
 
-MARKER = "[to_empty|cpu-load|materialize|env|whitelist]"
+MARKER = "[to_empty|cpu-load|materialize|env|whitelist|wan-check]"
 if MARKER not in src:
     append = r'''
-# ---- Diffusers VAE backend (WAN if available, else BASE) [to_empty|cpu-load|materialize|env|whitelist] ----
+# ---- Diffusers VAE backend (WAN if available, else BASE) [to_empty|cpu-load|materialize|env|whitelist|wan-check] ----
 import os as _os, inspect as _inspect
 import torch as _torch
 from huggingface_hub import hf_hub_download
 import json as _json
 
+# Try WAN first; log the result
+_WAN = False
+_WAN_IMPORT_ERR = None
 try:
     from diffusers import AutoencoderKLWan as _DiffVAE
     _WAN = True
-except Exception:
-    from diffusers import AutoencoderKL as _DiffVAE
-    _WAN = False
+    print("[vae] WAN import = OK (AutoencoderKLWan)")
+except Exception as e:
+    _WAN_IMPORT_ERR = str(e)
+    try:
+        from diffusers import AutoencoderKL as _DiffVAE
+        print("[vae] WAN import = FAIL -> falling back to BASE AutoencoderKL")
+    except Exception as e2:
+        print("[vae] BASE import failed too:", e2)
+        raise
+
+if not _WAN and _WAN_IMPORT_ERR:
+    print("[vae] WAN import error:", _WAN_IMPORT_ERR)
 
 def _filter_kwargs_for_ctor(cfg: dict, cls):
     import inspect
@@ -43,7 +73,6 @@ def _filter_kwargs_for_ctor(cfg: dict, cls):
     return {k: v for k, v in cfg.items() if k in allowed}
 
 def _materialize_on_cpu(module):
-    # materialize meta-params/buffers on CPU so .to(...) won't crash
     import torch.nn as _nn
     for name, p in list(module.named_parameters(recurse=True)):
         if getattr(p, "is_meta", False):
@@ -72,7 +101,7 @@ def _vae_build_diffusers(_device):
         raw_cfg = _json.load(f)
 
     cfg = raw_cfg if _WAN else _filter_kwargs_for_ctor(raw_cfg, _DiffVAE)
-    vae = _DiffVAE.from_config(cfg)  # create on CPU
+    vae = _DiffVAE.from_config(cfg)
     dtype = _torch.float16 if _device.type == "cuda" else _torch.float32
 
     used_to_empty = False
@@ -87,7 +116,6 @@ def _vae_build_diffusers(_device):
             except Exception:
                 used_to_empty = False
 
-    # load weights to CPU, filter by shape
     try:
         from safetensors.torch import load_file as _load_sf
         sd_full = _load_sf(w_path, device="cpu")
@@ -120,9 +148,8 @@ def _vae_build_diffusers(_device):
     return vae
 
 if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
-    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE) [to_empty|cpu-load|materialize|env|whitelist]")
+    print("[VAE] Using diffusers VAE backend (WAN if present, else BASE) [to_empty|cpu-load|materialize|env|whitelist|wan-check]")
     _g = globals()
-    # Патчим только Wan-классы, не трогаем diffusers.*
     WHITELIST = {"WanVAE_", "Wan2_1_VAE"}
     for _name, _cls in list(_g.items()):
         if not _inspect.isclass(_cls):
@@ -142,18 +169,11 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
             self.model = _vae_build_diffusers(_device)
         _cls.__init__ = _init
         print("[VAE] patched class:", _name)
-'''
+''' 
     src = src + "\n" + append
-
-    # Best-effort: make any hardcoded repo id env-driven
-    src = re.sub(
-        r'repo_id\s*=\s*"Wan-AI/Wan2\.2-TI2V-5B-Diffusers"',
-        'repo_id = _os.environ.get("WAN_VAE_REPO", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")',
-        src
-    )
-
+    src = re.sub(r'repo_id\s*=\s*"Wan-AI/Wan2\.2-TI2V-5B-Diffusers"', 'repo_id = _os.environ.get("WAN_VAE_REPO", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")', src)
     VAEP.write_text(src, encoding="utf-8")
-    print("[patch] inserted diffusers VAE backend with ENV control and whitelist")
+    print("[patch] inserted diffusers VAE backend with ENV control and whitelist (wan-check)")
 else:
     print("[patch] backend already present; skip")
 PY
