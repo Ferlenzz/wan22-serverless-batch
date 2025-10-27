@@ -471,6 +471,99 @@ else:
 PYPATCH_GUIDE
 
 # -----------------------------------------------------------------------------
+# image2video.py: helper для безопасной проверки boundary + массовые замены
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PYPATCH_BHELP'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/image2video.py")
+if not p.exists():
+    print("[patch][warn] not found:", p)
+else:
+    s = p.read_text(encoding="utf-8")
+    if "_wan_boundary_cond" not in s:
+        m = re.search(r"^(?:from\s+\S+\s+import\s+\S+|import\s+\S+).*$", s, re.M)
+        ins_at = m.end() if m else 0
+        helper = """
+
+# --- injected: safe boundary condition helper ---
+def _wan_boundary_cond(t, boundary):
+    \"\"\"Return True if current timestep t is considered '>= boundary'.
+    boundary can be: None | int/float | (lower, upper).\"\"\"
+    try:
+        ti = int(getattr(t, "item", lambda: t)())
+    except Exception:
+        try: ti = int(t)
+        except Exception: return False
+    _b = boundary
+    if _b is None:
+        return False
+    if isinstance(_b, tuple):
+        try:
+            _lo, _up = _b
+        except Exception:
+            try:
+                _up = int(_b[1])
+            except Exception:
+                return False
+        try:
+            return ti >= int(_up)
+        except Exception:
+            return False
+    try:
+        return ti >= int(_b)
+    except Exception:
+        try:
+            return ti >= int(float(_b))
+        except Exception:
+            return False
+# --- end helper ---
+"""
+        s = s[:ins_at] + helper + s[ins_at:]
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: _wan_boundary_cond helper inserted")
+    else:
+        print("[patch] image2video.py: helper already exists")
+PYPATCH_BHELP
+
+${PYBIN} - <<'PYPATCH_BREWRITE'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/image2video.py")
+if not p.exists():
+    print("[patch][warn] not found:", p)
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    pat_if = re.compile(r'^(?P<ind>\s*)if\s*t\.item\(\s*\)\s*>=\s*boundary\s*:\s*$', re.M)
+    s2 = pat_if.sub(lambda m: f"{m.group('ind')}if _wan_boundary_cond(t, boundary):", s)
+    if s2 != s:
+        s = s2; changed = True
+
+    pat_if2 = re.compile(r'^(?P<ind>\s*)if\s*t\s*>=\s*boundary\s*:\s*$', re.M)
+    s2 = pat_if2.sub(lambda m: f"{m.group('ind')}if _wan_boundary_cond(t, boundary):", s)
+    if s2 != s:
+        s = s2; changed = True
+
+    pat_tern = re.compile(
+        r'^(?P<ind>\s*)sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*'
+        r'if\s*t(?:\.item\(\s*\))?\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]\s*$',
+        re.M
+    )
+    def repl_tern(m):
+        ind = m.group('ind')
+        return f"{ind}sample_guide_scale = guide_scale[1] if _wan_boundary_cond(t, boundary) else guide_scale[0]"
+    s2 = pat_tern.sub(repl_tern, s)
+    if s2 != s:
+        s = s2; changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: boundary compares/ternary rewritten via helper")
+    else:
+        print("[patch] image2video.py: no boundary compare/ternary patterns found (maybe already patched)")
+PYPATCH_BREWRITE
+
+# -----------------------------------------------------------------------------
 # Запуск хэндлера
 # -----------------------------------------------------------------------------
 echo "[start] Launching handler..."
