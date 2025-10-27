@@ -9,6 +9,9 @@ PYBIN="${PYBIN:-python3}"
 # -----------------------------------------------------------------------------
 export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 
+# -----------------------------------------------------------------------------
+# Тихий sitecustomize: делает WanI2V вызываемым и шмит generate(...)
+# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY'
 from pathlib import Path
 code = r'''
@@ -86,7 +89,7 @@ for k in ("USE_DIFFUSERS_VAE","WAN_VAE_REPO","WAN_VAE_SUBFOLDER","WAN_VAE_FILENA
 PYINFO
 
 # -----------------------------------------------------------------------------
-# Гарантируем diffusers >= 0.35
+# Гарантируем diffusers >= 0.35 (не даунгрейдим)
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PYDIF'
 import sys, subprocess
@@ -471,7 +474,7 @@ else:
 PYPATCH_GUIDE
 
 # -----------------------------------------------------------------------------
-# image2video.py: helper для безопасной проверки boundary + массовые замены
+# image2video.py: ХЕЛПЕР для boundary + МАССОВЫЕ ЗАМЕНЫ (>=) и тернарника — универсально
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PYPATCH_BHELP'
 from pathlib import Path, re
@@ -563,20 +566,26 @@ else:
         print("[patch] image2video.py: no boundary compare/ternary patterns found (maybe already patched)")
 PYPATCH_BREWRITE
 
-# --- image2video.py: нормализация латентов до 48 каналов (безопасный слой)
-${PYBIN} - <<'PY'
+# -----------------------------------------------------------------------------
+# image2video.py: НОРМАЛИЗАЦИЯ КАНАЛОВ до C=48 — с правильным отступом (перманентно)
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PYPATCH_CH48'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/image2video.py")
-if p.exists():
+if not p.exists():
+    print("[patch][warn] image2video.py not found")
+else:
     s = p.read_text(encoding="utf-8")
     changed = False
+
+    # 0) helper _ensure_ch48 — вставим один раз сразу после "import os"
     if "_ensure_ch48" not in s:
         s = s.replace(
             "import os",
             "import os\n\n"
             "def _ensure_ch48(u):\n"
             "    import torch\n"
-            "    if u.dim() == 5:\n"
+            "    if u.dim() == 5:  # (B,C,T,H,W)\n"
             "        B,C,T,H,W = u.shape\n"
             "        if C == 48: return u\n"
             "        if T == 48 and C != 48: return u.permute(0,2,1,3,4)\n"
@@ -585,7 +594,7 @@ if p.exists():
             "            reps = (48 + C - 1)//C\n"
             "            return u.repeat(1, reps, 1, 1, 1)[:, :48]\n"
             "        return u\n"
-            "    elif u.dim() == 4:\n"
+            "    if u.dim() == 4:  # (C,T,H,W)\n"
             "        C,T,H,W = u.shape\n"
             "        if C == 48: return u\n"
             "        if T == 48 and C != 48: return u.permute(1,0,2,3)\n"
@@ -599,26 +608,28 @@ if p.exists():
         )
         changed = True
 
-    # В generate перед вызовом модели нормализуем x
-    s2 = re.sub(
-        r"noise_pred_cond\s*=\s*model\(",
-        "    x = [ _ensure_ch48(u) for u in x ]\n"
-        "    noise_pred_cond = model(",
-        s, count=1
-    )
+    # 1) удалить любые старые вставки x = [ _ensure_ch48(u) for u in x ]
+    s2 = re.sub(r'(?m)^\s*x\s*=\s*\[\s*_ensure_ch48\(\s*u\s*\)\s*for\s*u\s*in\s*x\s*\]\s*$', '', s)
     if s2 != s:
+        s = s2
+        changed = True
+
+    # 2) вставить нормализацию ПЕРЕД первой строкой "noise_pred_cond = model(" с тем же отступом
+    pat = re.compile(r'^(?P<ind>\s*)noise_pred_cond\s*=\s*model\(', re.M)
+    def repl(m):
+        ind = m.group('ind')
+        return f"{ind}x = [ _ensure_ch48(u) for u in x ]\n{ind}noise_pred_cond = model("
+    s2, n = pat.subn(repl, s, count=1)
+    if n > 0 and s2 != s:
         s = s2
         changed = True
 
     if changed:
         p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: _ensure_ch48 in place and applied")
+        print("[patch] image2video.py: ch48 helper added and normalization inserted with correct indent")
     else:
-        print("[patch] image2video.py: ch48 patch already present")
-else:
-    print("[patch][warn] image2video.py not found")
-PY
-
+        print("[patch] image2video.py: ch48 normalization already present")
+PYPATCH_CH48
 
 # -----------------------------------------------------------------------------
 # Запуск хэндлера
