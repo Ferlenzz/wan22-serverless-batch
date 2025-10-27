@@ -12,12 +12,12 @@ export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 # -----------------------------------------------------------------------------
 # sitecustomize.py (тихий):
 #  - делает WanI2V вызываемым (__call__)
-#  - shim для generate: нормализует self.boundary и маппит prompt/img по ИМЕНАМ
+#  - shim для generate: нормализует self.boundary и маппит prompt/img по именам
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY'
 from pathlib import Path
 code = r'''
-# не печатать ничего из этого файла
+# не печатать из этого файла
 import builtins, inspect
 
 def _normalize_boundary(self):
@@ -58,14 +58,10 @@ def _patch_wani2v(mod):
             sig = inspect.signature(gen)
             params = sig.parameters
             def _shim(self, *args, **kwargs):
-                # нормализуем boundary в self (None | int | (lo, up))
                 nb = _normalize_boundary(self)
-                try:
-                    object.__setattr__(self, 'boundary', nb)
-                except Exception:
-                    setattr(self, 'boundary', nb)
+                try: object.__setattr__(self, 'boundary', nb)
+                except Exception: setattr(self, 'boundary', nb)
 
-                # если позиционных нет — соберём из kwargs привычные поля
                 if not args:
                     prompt = kwargs.pop('prompt', kwargs.pop('input_prompt', ''))
                     img    = kwargs.pop('img', kwargs.pop('image', None))
@@ -77,24 +73,20 @@ def _patch_wani2v(mod):
                     if img is not None:
                         if 'img' in params: call_kwargs['img'] = img
                         elif 'image' in params: call_kwargs['image'] = img
-                        elif 'x' in params: call_kwargs['x'] = [img]  # если ожидается список кадров
+                        elif 'x' in params: call_kwargs['x'] = [img]
 
                     return gen(self, **call_kwargs)
-
-                # если есть позиционные — считаем их корректными
                 return gen(self, *args, **kwargs)
             _shim._shimmed_kwmap_boundary = True
             cls.generate = _shim
 
     except Exception:
-        # fail-quietly
         pass
 
 _orig_import = builtins.__import__
 def _hook(name, globals=None, locals=None, fromlist=(), level=0):
     m = _orig_import(name, globals, locals, fromlist, level)
     try:
-        # Патчим ПОСЛЕ импорта wan.image2video
         if name == "wan.image2video" or (name == "wan" and ("image2video" in (fromlist or ()) or fromlist == ("*",))):
             import sys as _sys
             mod = _sys.modules.get("wan.image2video")
@@ -111,7 +103,7 @@ print("[start] wrote sitecustomize.py (generate shim + boundary normalization)")
 PY
 
 # -----------------------------------------------------------------------------
-# Диагностика (можно печатать — это уже не внутри sitecustomize.py)
+# Диагностика
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PYINFO'
 import platform, os
@@ -149,7 +141,7 @@ except Exception:
 PYDIF
 
 # -----------------------------------------------------------------------------
-# vae2_1.py: инжект diffusers-бэкенда + жёсткий override _video_vae + guard .pth
+# vae2_1.py: diffusers VAE backend + hard override _video_vae + guard .pth
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PYPATCH_VAE'
 from pathlib import Path
@@ -161,11 +153,9 @@ if not p.exists():
 else:
     s = p.read_text(encoding="utf-8")
 
-    # ensure import os
     if "import os" not in s:
         s = ("import os\n" + s) if "import torch" not in s else s.replace("import torch", "import torch\nimport os", 1)
 
-    # inject diffusers backend (WAN if present)
     if "_vae_build_diffusers" not in s:
         s += """
 
@@ -208,12 +198,10 @@ def _vae_build_diffusers(_device):
 """
         print("[patch] vae2_1.py: diffusers backend injected")
 
-    # rename original _video_vae -> _video_vae_orig (one time)
     if "_video_vae_orig" not in s and "def _video_vae(" in s:
         s = s.replace("def _video_vae(", "def _video_vae_orig(", 1)
         print("[patch] vae2_1.py: renamed _video_vae -> _video_vae_orig")
 
-    # hard override _video_vae (env-gated)
     if "def _video_vae(*_args, **_kwargs):" not in s:
         s += """
 
@@ -229,7 +217,6 @@ def _video_vae(*_args, **_kwargs):
 """
         print("[patch] vae2_1.py: hard override for _video_vae added")
 
-    # guard any model.load_state_dict(torch.load(pretrained_path...)) when USE_DIFFUSERS_VAE=1
     s2 = re.sub(
         r"(?m)^(?P<ind>\s*)model\.load_state_dict\(\s*torch\.load\(\s*pretrained_path.*$",
         r"\g<ind>if os.environ.get('USE_DIFFUSERS_VAE','0')!='1' and os.path.isfile(pretrained_path):\n"
@@ -245,7 +232,7 @@ def _video_vae(*_args, **_kwargs):
 PYPATCH_VAE
 
 # -----------------------------------------------------------------------------
-# image2video.py: делаем low/high_noise_checkpoint опциональными (ENV-aware)
+# image2video.py: low/high_noise_checkpoint опциональны (ENV-aware)
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PYPATCH_NOISE'
 from pathlib import Path
@@ -334,108 +321,10 @@ else:
 PYPATCH_ENCODE
 
 # -----------------------------------------------------------------------------
-# image2video.py: безопасная обработка boundary и сравнения (подстраховка)
+# image2video.py: ГЛОБАЛЬНЫЙ безопасный патч сравнения с boundary + локальная boundary
 # -----------------------------------------------------------------------------
-${PYBIN} - <<'PYPATCH_BOUNDARY'
-from pathlib import Path
-import re
-
-p = Path("/app/Wan2.2/wan/image2video.py")
-if not p.exists():
-    print("[patch][warn] not found:", p)
-else:
-    s = p.read_text(encoding="utf-8")
-    changed = False
-
-    # normalize: boundary = self.boundary * self.num_train_timesteps
-    pat = re.compile(r'^(?P<ind>\s*)boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$', re.M)
-    def repl(m):
-        ind  = m.group('ind'); ind1 = ind + "    "
-        return (
-            f"{ind}# normalize boundary (dict or scalar)\n"
-            f"{ind}_b = self.boundary\n"
-            f"{ind}_n = self.num_train_timesteps\n"
-            f"{ind}if isinstance(_b, dict) or hasattr(_b, 'get'):\n"
-            f"{ind1}if not (_b.get('enabled', False)):\n"
-            f"{ind1}    boundary = None\n"
-            f"{ind1}else:\n"
-            f"{ind1}    _lo = int(max(0, min(1, float(_b.get('lower', 0.0)))) * _n)\n"
-            f"{ind1}    _up = int(max(0, min(1, float(_b.get('upper', 1.0)))) * _n)\n"
-            f"{ind1}    boundary = (_lo, _up)\n"
-            f"{ind}else:\n"
-            f"{ind1}try:\n"
-            f"{ind1}    boundary = int(float(_b) * _n)\n"
-            f"{ind1}except Exception:\n"
-            f"{ind1}    boundary = None"
-        )
-    s2 = pat.sub(repl, s)
-    if s2 != s:
-        s = s2; changed = True
-
-    # safe compare "if t.item() >= boundary:"
-    s2 = re.sub(
-        r'^(?P<ind>\s*)if\s+t\.item\(\)\s*>=\s*boundary\s*:\s*$',
-        lambda m: (
-            f"{m.group('ind')}# safe compare with boundary that may be None | int | (lo, up)\n"
-            f"{m.group('ind')}_b = boundary\n"
-            f"{m.group('ind')}if _b is None:\n"
-            f"{m.group('ind')}    _cond = False\n"
-            f"{m.group('ind')}elif isinstance(_b, tuple):\n"
-            f"{m.group('ind')}    try:\n"
-            f"{m.group('ind')}        _lo, _up = _b\n"
-            f"{m.group('ind')}    except Exception:\n"
-            f"{m.group('ind')}        _lo, _up = 0, int(_b[1]) if len(_b)>1 else 0\n"
-            f"{m.group('ind')}    _cond = (t.item() >= _up)\n"
-            f"{m.group('ind')}else:\n"
-            f"{m.group('ind')}    try:\n"
-            f"{m.group('ind')}        _cond = (t.item() >= int(_b))\n"
-            f"{m.group('ind')}    except Exception:\n"
-            f"{m.group('ind')}        _cond = False\n"
-            f"{m.group('ind')}if _cond:"
-        ),
-        s, flags=re.M
-    )
-    if s2 != s:
-        s = s2; changed = True
-
-    # safe ternary for sample_guide_scale
-    s2 = re.sub(
-        r'^(?P<ind>\s*)sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]\s*$',
-        lambda m: (
-            f"{m.group('ind')}_b = boundary\n"
-            f"{m.group('ind')}if _b is None:\n"
-            f"{m.group('ind')}    _cond = False\n"
-            f"{m.group('ind')}elif isinstance(_b, tuple):\n"
-            f"{m.group('ind')}    try:\n"
-            f"{m.group('ind')}        _lo, _up = _b\n"
-            f"{m.group('ind')}    except Exception:\n"
-            f"{m.group('ind')}        _lo, _up = 0, int(_b[1]) if len(_b)>1 else 0\n"
-            f"{m.group('ind')}    _cond = (t.item() >= _up)\n"
-            f"{m.group('ind')}else:\n"
-            f"{m.group('ind')}    try:\n"
-            f"{m.group('ind')}        _cond = (t.item() >= int(_b))\n"
-            f"{m.group('ind')}    except Exception:\n"
-            f"{m.group('ind')}        _cond = False\n"
-            f"{m.group('ind')}sample_guide_scale = guide_scale[1] if _cond else guide_scale[0]"
-        ),
-        s, flags=re.M
-    )
-    if s2 != s:
-        s = s2; changed = True
-
-    if changed:
-        p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: boundary handling & safe compares applied")
-    else:
-        print("[patch] image2video.py: boundary patches already applied or pattern not found")
-PYPATCH_BOUNDARY
-
-# -----------------------------------------------------------------------------
-# PERM PATCH: локальная boundary внутри generate() и безопасные сравнения (_bcond)
-# -----------------------------------------------------------------------------
-${PYBIN} - <<'PYPATCH_GEN_LOCAL'
+${PYBIN} - <<'PYPATCH_BOUNDARY_GLOBAL'
 from pathlib import Path, re
-
 p = Path("/app/Wan2.2/wan/image2video.py")
 if not p.exists():
     print("[patch][warn] not found:", p)
@@ -443,76 +332,60 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) Добавим хелперы, если их нет
-    if "_normalize_boundary_guarded" not in s:
-        s = s.replace(
-            "import os",
-            "import os\n\n"
-            "def _normalize_boundary_guarded(self):\n"
-            "    try:\n"
-            "        b = getattr(self, 'boundary', None)\n"
-            "        n = int(getattr(self, 'num_train_timesteps', 1000))\n"
-            "        if isinstance(b, dict) or hasattr(b, 'get'):\n"
-            "            if not b.get('enabled', False):\n"
-            "                return None\n"
-            "            lo = int(max(0, min(1, float(b.get('lower', 0.0)))) * n)\n"
-            "            up = int(max(0, min(1, float(b.get('upper', 1.0)))) * n)\n"
-            "            return (lo, up)\n"
-            "        if b is None:\n"
-            "            return None\n"
-            "        return int(float(b) * n) if isinstance(b, (int, float, str)) else None\n"
-            "    except Exception:\n"
-            "        return None\n\n"
-            "def _bcond(t, b):\n"
-            "    if b is None:\n"
-            "        return False\n"
-            "    if isinstance(b, tuple):\n"
-            "        try:\n"
-            "            lo, up = b\n"
-            "        except Exception:\n"
-            "            lo, up = 0, int(b[1]) if hasattr(b,'__len__') and len(b)>1 else 0\n"
-            "        return t.item() >= up\n"
-            "    try:\n"
-            "        return t.item() >= int(b)\n"
-            "    except Exception:\n"
-            "        return False\n",
-            1
-        )
+    # 1) Вставим safe helper один раз (после первых импортов)
+    helper = r"""
+# --- safe boundary compare helper (None | int | tuple(lo, up)) ---
+def _cmp_ge_boundary(t_val, boundary):
+    if boundary is None:
+        return False
+    if isinstance(boundary, tuple):
+        try:
+            _, up = boundary
+        except Exception:
+            up = int(boundary[1]) if hasattr(boundary,'__len__') and len(boundary) > 1 else 0
+        try:
+            return t_val >= int(up)
+        except Exception:
+            return False
+    try:
+        return t_val >= int(boundary)
+    except Exception:
+        return False
+"""
+    if "_cmp_ge_boundary(" not in s:
+        s = re.sub(r"^(import[^\n]+\n(?:from[^\n]+\n)*)", r"\1"+helper+"\n", s, count=1, flags=re.M)
         changed = True
 
-    # 2) В начале generate(): boundary = _normalize_boundary_guarded(self)
+    # 2) Тернарники "guide_scale[1] if t.item() >= boundary else guide_scale[0]"
+    s2 = re.sub(
+        r"guide_scale\[\s*1\s*\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]",
+        r"guide_scale[1] if _cmp_ge_boundary(t.item(), boundary) else guide_scale[0]",
+        s
+    )
+    if s2 != s: s = s2; changed = True
+
+    # 3) Любые "if t.item() >= boundary:"
+    s2 = re.sub(
+        r"if\s+t\.item\(\)\s*>=\s*boundary\s*:",
+        r"if _cmp_ge_boundary(t.item(), boundary):",
+        s
+    )
+    if s2 != s: s = s2; changed = True
+
+    # 4) В начале generate(): локальная нормализация boundary
     s2 = re.sub(
         r"(?ms)^(\s*def\s+generate\s*\(.*?\):\s*\n)(\s*)(\S)",
-        lambda m: f"{m.group(1)}{m.group(2)}boundary = _normalize_boundary_guarded(self)\n{m.group(2)}{m.group(3)}",
+        lambda m: f"{m.group(1)}{m.group(2)}boundary = getattr(self, 'boundary', None)\n{m.group(2)}{m.group(3)}",
         s
     )
-    if s2 != s:
-        s = s2; changed = True
-
-    # 3) Тернарник sample_guide_scale ... if t.item() >= boundary ...
-    s2 = re.sub(
-        r"sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]",
-        "sample_guide_scale = guide_scale[1] if _bcond(t, boundary) else guide_scale[0]",
-        s
-    )
-    if s2 != s:
-        s = s2; changed = True
-
-    # 4) Любые if t.item() >= boundary:
-    s2 = re.sub(
-        r"(?m)^(?P<ind>\s*)if\s+t\.item\(\)\s*>=\s*boundary\s*:\s*$",
-        lambda m: f"{m.group('ind')}if _bcond(t, boundary):",
-        s
-    )
-    if s2 != s:
-        s = s2; changed = True
+    if s2 != s: s = s2; changed = True
 
     if changed:
         p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: generate() local boundary normalized + safe compares")
+        print("[patch] image2video.py: global safe boundary compare + local boundary init")
     else:
-        print("[patch] image2video.py: generate() already patched")
-PYPATCH_GEN_LOCAL
+        print("[patch] image2video.py: boundary globals already applied")
+PYPATCH_BOUNDARY_GLOBAL
 
 # -----------------------------------------------------------------------------
 # Запуск хэндлера
