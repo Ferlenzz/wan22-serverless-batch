@@ -10,55 +10,50 @@ PYBIN="${PYBIN:-python3}"
 export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 
 # -----------------------------------------------------------------------------
-# Пишем ТИХИЙ sitecustomize.py (никаких print внутри файла!)
-# Делает WanI2V вызываемым: __call__ делегирует на generate/infer/run/...
+# Пишем УЛЬТРА-ТИХИЙ и «ленивый» sitecustomize.py:
+#  - никаких print внутри файла
+#  - не делает ранних импортов wan.*, только перехватывает __import__
+#  - когда кто-то импортирует wan.image2video, молча навешивает __call__ на WanI2V
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY'
 from pathlib import Path
 code = r'''
-# Do NOT print here — this runs before everything else (py-cpuinfo expects clean stdout).
-try:
-    import sys, os, builtins
-    for p in ("/app", "/app/Wan2.2"):
-        if p not in sys.path and os.path.isdir(p):
-            sys.path.insert(0, p)
+# absolutely no prints here; loaded before everything else
+import builtins
 
-    def _patch():
-        try:
-            import wan.image2video as _m
-            _cls = getattr(_m, "WanI2V", None)
-            if _cls is not None and not hasattr(_cls, "__call__"):
-                def __call__(self, *args, **kwargs):
-                    for name in ("generate","infer","forward","run","predict","sample"):
-                        fn = getattr(self, name, None)
-                        if callable(fn):
-                            return fn(*args, **kwargs)
-                    raise TypeError("WanI2V is not callable and no known generate method found")
-                _cls.__call__ = __call__
-            return True
-        except ModuleNotFoundError:
-            return False
-        except Exception:
-            return False
+def _patch_wani2v(mod):
+    try:
+        cls = getattr(mod, "WanI2V", None)
+        if cls is not None and not hasattr(cls, "__call__"):
+            def __call__(self, *args, **kwargs):
+                for name in ("generate","infer","forward","run","predict","sample"):
+                    fn = getattr(self, name, None)
+                    if callable(fn):
+                        return fn(*args, **kwargs)
+                raise TypeError("WanI2V is not callable and no known generate-like method was found")
+            cls.__call__ = __call__
+    except Exception:
+        # fail-quietly
+        pass
 
-    if not _patch():
-        _orig_import = builtins.__import__
-        def _hook(name, globals=None, locals=None, fromlist=(), level=0):
-            mod = _orig_import(name, globals, locals, fromlist, level)
-            # если wan.image2video загрузится позже — допатчим
-            try:
-                if name == "wan.image2video" or (name == "wan" and ("image2video" in fromlist or fromlist == ("*",))):
-                    _patch()
-            except Exception:
-                pass
-            return mod
-        builtins.__import__ = _hook
-except Exception:
-    # fail-quietly
-    pass
+_orig_import = builtins.__import__
+def _hook(name, globals=None, locals=None, fromlist=(), level=0):
+    m = _orig_import(name, globals, locals, fromlist, level)
+    # patch only AFTER wan.image2video is actually imported by user code
+    try:
+        if name == "wan.image2video" or (name == "wan" and ("image2video" in (fromlist or ()) or fromlist == ("*",))):
+            import sys as _sys
+            mod = _sys.modules.get("wan.image2video")
+            if mod is not None:
+                _patch_wani2v(mod)
+    except Exception:
+        pass  # never print here
+    return m
+
+builtins.__import__ = _hook
 '''
 Path("/app/sitecustomize.py").write_text(code, encoding="utf-8")
-print("[start] wrote quiet sitecustomize.py")
+print("[start] wrote ultra-quiet lazy sitecustomize.py")
 PY
 
 # -----------------------------------------------------------------------------
