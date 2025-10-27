@@ -199,5 +199,21 @@ else:
         print("[guard] target .pth load line not found — maybe already patched")
 PY
 
+# --- ensure 'import os' in vae2_1.py (needed for USE_DIFFUSERS_VAE env check)
+python3 - <<'PY'
+from pathlib import Path
+p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
+if p.exists():
+    s = p.read_text(encoding="utf-8")
+    if "import os" not in s:
+        s = s.replace("import torch", "import torch\nimport os", 1)
+        p.write_text(s, encoding="utf-8")
+        print("[start][patch] added 'import os' to vae2_1.py")
+    else:
+        print("[start][patch] 'import os' already present")
+else:
+    print("[start][patch][warn] vae2_1.py not found at", p)
+PY
+
 echo "[start] Launching handler..."
 exec python3 -u /app/handler.py
