@@ -4,7 +4,7 @@ set -euo pipefail
 echo "[start] STARTING start.sh"
 PYBIN="${PYBIN:-python3}"
 
-# --- Runtime info
+# --- Runtime info -------------------------------------------------------------
 ${PYBIN} - <<'PYINFO'
 import platform
 print(f"[runtime] python {platform.python_version()}")
@@ -15,7 +15,7 @@ except Exception as e:
     print("[runtime] torch not importable:", e)
 PYINFO
 
-# --- Ensure diffusers >= 0.35 (do NOT downgrade)
+# --- Ensure diffusers >= 0.35 (do NOT downgrade) -----------------------------
 ${PYBIN} - <<'PYDIF'
 import sys, subprocess
 from packaging.version import Version
@@ -32,17 +32,18 @@ except Exception:
     run("install","-q","--upgrade","diffusers>=0.35.0")
 PYDIF
 
-# --- Echo important ENV
+# --- Echo important ENV -------------------------------------------------------
 ${PYBIN} - <<'PYENV'
 import os
 for k in ("USE_DIFFUSERS_VAE","WAN_VAE_REPO","WAN_VAE_SUBFOLDER",
-          "WAN_VAE_FILENAME","WAN_LOW_NOISE_SUBFOLDER","WAN_CKPT_DIR","HF_HOME"):
+          "WAN_VAE_FILENAME","WAN_LOW_NOISE_SUBFOLDER","WAN_HIGH_NOISE_SUBFOLDER",
+          "WAN_CKPT_DIR","HF_HOME"):
     v = os.environ.get(k)
     if v is not None:
         print(f"[env] {k} = {v}")
 PYENV
 
-# --- Patch vae2_1.py: inject diffusers backend builder + HARD OVERRIDE of _video_vae
+# --- Patch vae2_1.py: inject diffusers backend + HARD OVERRIDE of _video_vae --
 ${PYBIN} - <<'PYPATCH1'
 from pathlib import Path
 import re, os
@@ -50,7 +51,7 @@ import re, os
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
-# Ensure imports near top (best-effort)
+# Ensure imports (best-effort)
 if "import os" not in s:
     if "import torch" in s:
         s = s.replace("import torch", "import torch\nimport os", 1)
@@ -154,7 +155,7 @@ p.write_text(s, encoding="utf-8")
 print("[patch] vae2_1.py saved")
 PYPATCH1
 
-# --- ensure _video_vae imports os locally (robust, idempotent)
+# --- ensure _video_vae imports os locally (robust, idempotent) ----------------
 ${PYBIN} - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
@@ -172,7 +173,7 @@ else:
     print("[start][patch] _video_vae already robust or not found")
 PY
 
-# --- ensure 'import os' at very top of vae2_1.py (robust, idempotent)
+# --- ensure 'import os' at very top of vae2_1.py (robust, idempotent) --------
 ${PYBIN} - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
@@ -184,8 +185,8 @@ else:
     print("[start][patch] 'import os' already present (top or elsewhere)")
 PY
 
-# --- Make low_noise_checkpoint optional (ENV WAN_LOW_NOISE_SUBFOLDER or None)
-${PYBIN} - <<'PYPATCH2'
+# --- Make *_noise_checkpoint optional (low/high, env-aware) -------------------
+${PYBIN} - <<'PYPATCH_NOISE'
 from pathlib import Path
 import re, os
 
@@ -196,7 +197,7 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # ensure import os is available
+    # ensure import os
     if "import os" not in s:
         if "import torch" in s:
             s = s.replace("import torch", "import torch\nimport os", 1)
@@ -204,30 +205,38 @@ else:
             s = "import os\n" + s
         changed = True
 
-    # any 'subfolder=config.low_noise_checkpoint' -> env-aware optional
-    s2 = re.sub(
-        r"subfolder\s*=\s*config\.low_noise_checkpoint",
-        r"subfolder=(os.environ.get('WAN_LOW_NOISE_SUBFOLDER') or getattr(config,'low_noise_checkpoint',None))",
-        s
-    )
-    if s2 != s:
-        s = s2; changed = True
+    def patch_noise(s, name, env, prefix):
+        ch = False
+        # subfolder=config.<name>  ->  env-aware getter
+        s2 = re.sub(
+            rf"subfolder\s*=\s*config\.{name}",
+            rf"subfolder=(os.environ.get('{env}') or getattr(config,'{name}',None))",
+            s
+        )
+        if s2 != s:
+            s = s2; ch = True
 
-    # wrap direct assignment to self.low_noise with _ln guard
-    s2 = re.sub(
-        r"(?P<ind>\s*)self\.low_noise\s*=\s*load_model\(\s*checkpoint_dir\s*,\s*subfolder\s*=\s*(.+?)\)",
-        r"\g<ind>_ln = (\2)\n\g<ind>self.low_noise = load_model(checkpoint_dir, subfolder=_ln) if _ln else None",
-        s
-    )
-    if s2 != s:
-        s = s2; changed = True
+        # self.<prefix>_noise = load_model(... subfolder=...)
+        s2 = re.sub(
+            rf"(?P<ind>\s*)self\.{prefix}_noise\s*=\s*load_model\(\s*checkpoint_dir\s*,\s*subfolder\s*=\s*(.+?)\)",
+            rf"\g<ind>_n = (\2)\n\g<ind>self.{prefix}_noise = load_model(checkpoint_dir, subfolder=_n) if _n else None",
+            s
+        )
+        if s2 != s:
+            s = s2; ch = True
+        return s, ch
+
+    # apply for both low and high
+    s, ch = patch_noise(s, "low_noise_checkpoint",  "WAN_LOW_NOISE_SUBFOLDER",  "low");  changed |= ch
+    s, ch = patch_noise(s, "high_noise_checkpoint", "WAN_HIGH_NOISE_SUBFOLDER", "high"); changed |= ch
 
     if changed:
         p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py updated (low_noise optional)")
+        print("[patch] image2video.py: low/high noise checkpoints are optional (env-aware)")
     else:
-        print("[patch] image2video.py already ok")
-PYPATCH2
+        print("[patch] image2video.py: already optional or patterns not found")
+PYPATCH_NOISE
 
+# --- Launch -------------------------------------------------------------------
 echo "[start] Launching handler..."
 exec ${PYBIN} -u /app/handler.py
