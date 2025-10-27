@@ -10,15 +10,31 @@ PYBIN="${PYBIN:-python3}"
 export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 
 # -----------------------------------------------------------------------------
-# ТИХИЙ sitecustomize.py:
-#  - Делает WanI2V вызываемым (__call__)
-#  - Шим для generate: корректно маппит prompt/img по ИМЕНАМ параметров
+# sitecustomize.py (тихий):
+#  - делает WanI2V вызываемым (__call__)
+#  - shim для generate: нормализует self.boundary и маппит prompt/img по ИМЕНАМ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY'
 from pathlib import Path
 code = r'''
-# НИЧЕГО не печатаем отсюда!
+# не печатать ничего из этого файла
 import builtins, inspect
+
+def _normalize_boundary(self):
+    try:
+        b = getattr(self, 'boundary', None)
+        n = int(getattr(self, 'num_train_timesteps', 1000))
+        if isinstance(b, dict) or hasattr(b, 'get'):
+            if not b.get('enabled', False):
+                return None
+            lo = int(max(0, min(1, float(b.get('lower', 0.0)))) * n)
+            up = int(max(0, min(1, float(b.get('upper', 1.0)))) * n)
+            return (lo, up)
+        if b is None:
+            return None
+        return int(float(b) * n) if isinstance(b, (int, float, str)) else None
+    except Exception:
+        return None
 
 def _patch_wani2v(mod):
     try:
@@ -28,50 +44,46 @@ def _patch_wani2v(mod):
 
         # 1) сделать класс вызываемым (__call__), делегируя на generate/infer/…
         if not hasattr(cls, "__call__"):
-            def __call__(self, *args, **kwargs):
+            def __call__(self, *a, **k):
                 for name in ("generate","infer","forward","run","predict","sample"):
                     fn = getattr(self, name, None)
                     if callable(fn):
-                        return fn(*args, **kwargs)
+                        return fn(*a, **k)
                 raise TypeError("WanI2V is not callable and no known generate-like method was found")
             cls.__call__ = __call__
 
-        # 2) шим для generate: ПЕРЕДАЁМ ПО ИМЕНАМ, с учётом сигнатуры
+        # 2) generate-shim: нормализуем boundary и маппим именованные аргументы
         gen = getattr(cls, "generate", None)
-        if callable(gen) and not getattr(gen, "_shimmed_kwmap", False):
+        if callable(gen) and not getattr(gen, "_shimmed_kwmap_boundary", False):
             sig = inspect.signature(gen)
             params = sig.parameters
-
             def _shim(self, *args, **kwargs):
-                # если пользователь не дал позиционных — соберём из kwargs стандартные поля
+                # нормализуем boundary в self (None | int | (lo, up))
+                nb = _normalize_boundary(self)
+                try:
+                    object.__setattr__(self, 'boundary', nb)
+                except Exception:
+                    setattr(self, 'boundary', nb)
+
+                # если позиционных нет — соберём из kwargs привычные поля
                 if not args:
-                    # извлекаем значения из входных kwargs (если есть)
                     prompt = kwargs.pop('prompt', kwargs.pop('input_prompt', ''))
                     img    = kwargs.pop('img', kwargs.pop('image', None))
+                    call_kwargs = dict(kwargs)
 
-                    # подбираем подходящие имена из сигнатуры generate(...)
-                    call_kwargs = dict(kwargs)  # сохранить прочие
-
-                    if 'prompt' in params:
-                        call_kwargs['prompt'] = prompt
-                    elif 'input_prompt' in params:
-                        call_kwargs['input_prompt'] = prompt
+                    if 'prompt' in params: call_kwargs['prompt'] = prompt
+                    elif 'input_prompt' in params: call_kwargs['input_prompt'] = prompt
 
                     if img is not None:
-                        if 'img' in params:
-                            call_kwargs['img'] = img
-                        elif 'image' in params:
-                            call_kwargs['image'] = img
-                        elif 'x' in params:
-                            # если метод ждёт уже нормализованное x (список), завернём в список
-                            call_kwargs['x'] = [img]
+                        if 'img' in params: call_kwargs['img'] = img
+                        elif 'image' in params: call_kwargs['image'] = img
+                        elif 'x' in params: call_kwargs['x'] = [img]  # если ожидается список кадров
 
                     return gen(self, **call_kwargs)
 
-                # если есть позиционные — не трогаем (считаем, что порядок верный)
+                # если есть позиционные — считаем их корректными
                 return gen(self, *args, **kwargs)
-
-            _shim._shimmed_kwmap = True
+            _shim._shimmed_kwmap_boundary = True
             cls.generate = _shim
 
     except Exception:
@@ -82,20 +94,20 @@ _orig_import = builtins.__import__
 def _hook(name, globals=None, locals=None, fromlist=(), level=0):
     m = _orig_import(name, globals, locals, fromlist, level)
     try:
-        # Патчим только ПОСЛЕ фактического импорта wan.image2video
+        # Патчим ПОСЛЕ импорта wan.image2video
         if name == "wan.image2video" or (name == "wan" and ("image2video" in (fromlist or ()) or fromlist == ("*",))):
             import sys as _sys
             mod = _sys.modules.get("wan.image2video")
             if mod is not None:
                 _patch_wani2v(mod)
     except Exception:
-        pass  # никогда ничего не печатаем
+        pass
     return m
 
 builtins.__import__ = _hook
 '''
 Path("/app/sitecustomize.py").write_text(code, encoding="utf-8")
-print("[start] wrote ultra-quiet lazy sitecustomize.py (+generate kw shim)")
+print("[start] wrote sitecustomize.py (generate shim + boundary normalization)")
 PY
 
 # -----------------------------------------------------------------------------
@@ -322,7 +334,7 @@ else:
 PYPATCH_ENCODE
 
 # -----------------------------------------------------------------------------
-# image2video.py: boundary-handling и безопасные сравнения (как у тебя было)
+# image2video.py: безопасная обработка boundary и сравнения (подстраховка)
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PYPATCH_BOUNDARY'
 from pathlib import Path
@@ -335,13 +347,10 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    pat = re.compile(
-        r'^(?P<ind>\s*)boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$',
-        re.M
-    )
+    # normalize: boundary = self.boundary * self.num_train_timesteps
+    pat = re.compile(r'^(?P<ind>\s*)boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$', re.M)
     def repl(m):
-        ind  = m.group('ind')
-        ind1 = ind + "    "
+        ind  = m.group('ind'); ind1 = ind + "    "
         return (
             f"{ind}# normalize boundary (dict or scalar)\n"
             f"{ind}_b = self.boundary\n"
@@ -361,11 +370,10 @@ else:
         )
     s2 = pat.sub(repl, s)
     if s2 != s:
-        s = s2
-        changed = True
+        s = s2; changed = True
 
-    # safe compare if t.item() >= boundary
-    s = re.sub(
+    # safe compare "if t.item() >= boundary:"
+    s2 = re.sub(
         r'^(?P<ind>\s*)if\s+t\.item\(\)\s*>=\s*boundary\s*:\s*$',
         lambda m: (
             f"{m.group('ind')}# safe compare with boundary that may be None | int | (lo, up)\n"
@@ -387,9 +395,11 @@ else:
         ),
         s, flags=re.M
     )
+    if s2 != s:
+        s = s2; changed = True
 
     # safe ternary for sample_guide_scale
-    s = re.sub(
+    s2 = re.sub(
         r'^(?P<ind>\s*)sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]\s*$',
         lambda m: (
             f"{m.group('ind')}_b = boundary\n"
@@ -410,9 +420,14 @@ else:
         ),
         s, flags=re.M
     )
+    if s2 != s:
+        s = s2; changed = True
 
-    p.write_text(s, encoding="utf-8")
-    print("[patch] image2video.py: boundary handling & safe compares applied")
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: boundary handling & safe compares applied")
+    else:
+        print("[patch] image2video.py: boundary patches already applied or pattern not found")
 PYPATCH_BOUNDARY
 
 # -----------------------------------------------------------------------------
