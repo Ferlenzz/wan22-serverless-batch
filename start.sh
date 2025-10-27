@@ -293,10 +293,11 @@ else:
 PYPATCH_ENCODE
 
 # -----------------------------------------------------------------------------
-# image2video.py: поддержка boundary как dict (enabled/low/upper) и как числа
+# image2video.py: поддержка boundary как dict (enabled/lower/upper) и как числа — INDENT-AWARE
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PYPATCH_BOUNDARY'
-from pathlib import Path, re
+from pathlib import Path
+import re
 
 p = Path("/app/Wan2.2/wan/image2video.py")
 if not p.exists():
@@ -305,35 +306,52 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) Нормализуем вычисление boundary: dict -> (lo_idx, up_idx) | None; число -> int(...)
-    # Ищем строку вида: boundary = self.boundary * self.num_train_timesteps
-    pat = re.compile(r"^\s*boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$", re.M)
-    if pat.search(s):
-        s = pat.sub(
-            (
-                "    # normalize boundary (dict or scalar)\n"
-                "    _b = self.boundary\n"
-                "    _n = self.num_train_timesteps\n"
-                "    if isinstance(_b, dict) or hasattr(_b, 'get'):\n"
-                "        if not (_b.get('enabled', False)):\n"
-                "            boundary = None\n"
-                "        else:\n"
-                "            _lo = int(max(0, min(1, float(_b.get('lower', 0.0)))) * _n)\n"
-                "            _up = int(max(0, min(1, float(_b.get('upper', 1.0)))) * _n)\n"
-                "            boundary = (_lo, _up)\n"
-                "    else:\n"
-                "        try:\n"
-                "            boundary = int(float(_b) * _n)\n"
-                "        except Exception:\n"
-                "            boundary = None\n"
-            ),
-            s
+    # Ищем строку вроде: boundary = self.boundary * self.num_train_timesteps
+    # (допускаем пробелы/их отсутствие вокруг '*')
+    pat = re.compile(
+        r'^(?P<ind>\s*)boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$',
+        re.M
+    )
+
+    def repl(m):
+        ind  = m.group('ind')               # исходный базовый отступ
+        ind1 = ind + "    "                 # +1 уровень вложенности
+        return (
+            f"{ind}# normalize boundary (dict or scalar)\n"
+            f"{ind}_b = self.boundary\n"
+            f"{ind}_n = self.num_train_timesteps\n"
+            f"{ind}if isinstance(_b, dict) or hasattr(_b, 'get'):\n"
+            f"{ind1}if not (_b.get('enabled', False)):\n"
+            f"{ind1}    boundary = None\n"
+            f"{ind1}else:\n"
+            f"{ind1}    _lo = int(max(0, min(1, float(_b.get('lower', 0.0)))) * _n)\n"
+            f"{ind1}    _up = int(max(0, min(1, float(_b.get('upper', 1.0)))) * _n)\n"
+            f"{ind1}    boundary = (_lo, _up)\n"
+            f"{ind}else:\n"
+            f"{ind1}try:\n"
+            f"{ind1}    boundary = int(float(_b) * _n)\n"
+            f"{ind1}except Exception:\n"
+            f"{ind1}    boundary = None"
         )
+
+    s2 = pat.sub(repl, s)
+    if s2 != s:
+        s = s2
         changed = True
+    else:
+        # запасной паттерн без пробелов вокруг '*'
+        pat2 = re.compile(
+            r'^(?P<ind>\s*)boundary\s*=\s*self\.boundary\*\s*self\.num_train_timesteps\s*$',
+            re.M
+        )
+        s3 = pat2.sub(repl, s)
+        if s3 != s:
+            s = s3
+            changed = True
 
     if changed:
         p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: boundary handling normalized (dict/scalar)")
+        print("[patch] image2video.py: boundary handling normalized (indent-aware)")
     else:
         print("[patch] image2video.py: boundary patch not applied (pattern not found) — maybe already patched?")
 PYPATCH_BOUNDARY
