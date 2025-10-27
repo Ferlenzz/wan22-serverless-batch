@@ -36,11 +36,13 @@ PYDIF
 ${PYBIN} - <<'PYENV'
 import os
 for k in ("USE_DIFFUSERS_VAE","WAN_VAE_REPO","WAN_VAE_SUBFOLDER",
-          "WAN_VAE_FILENAME","WAN_LOW_NOISE_SUBFOLDER","WAN_CKPT_DIR"):
-    print(f"[env] {k} =", os.environ.get(k))
+          "WAN_VAE_FILENAME","WAN_LOW_NOISE_SUBFOLDER","WAN_CKPT_DIR","HF_HOME"):
+    v = os.environ.get(k)
+    if v is not None:
+        print(f"[env] {k} = {v}")
 PYENV
 
-# --- Patch vae2_1.py: inject diffusers backend and HARD OVERRIDE _video_vae (skip .pth when USE_DIFFUSERS_VAE=1)
+# --- Patch vae2_1.py: inject diffusers backend builder + HARD OVERRIDE of _video_vae
 ${PYBIN} - <<'PYPATCH1'
 from pathlib import Path
 import re, os
@@ -48,9 +50,12 @@ import re, os
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
-# Ensure imports
+# Ensure imports near top (best-effort)
 if "import os" not in s:
-    s = s.replace("import torch", "import torch\nimport os", 1)
+    if "import torch" in s:
+        s = s.replace("import torch", "import torch\nimport os", 1)
+    else:
+        s = "import os\n" + s
 
 # Inject diffusers backend builder if not present
 if "_vae_build_diffusers" not in s:
@@ -122,18 +127,20 @@ def _vae_build_diffusers(_device):
 """
     print("[patch] injected _vae_build_diffusers")
 
-# Rename original _video_vae once (to keep fallback), then add hard override
+# Rename original _video_vae once (to keep fallback)
 if "_video_vae_orig" not in s and "def _video_vae(" in s:
     s = s.replace("def _video_vae(", "def _video_vae_orig(", 1)
     print("[patch] renamed original _video_vae -> _video_vae_orig")
 
+# Add HARD override _video_vae (env-gated) if missing
 if "def _video_vae(*_args, **_kwargs):" not in s:
     s += r"""
 
 # === Injected: HARD OVERRIDE of _video_vae when USE_DIFFUSERS_VAE=1 ===
 def _video_vae(*_args, **_kwargs):
+    import os as __os
     import torch as __torch
-    if os.environ.get('USE_DIFFUSERS_VAE','0') == '1':
+    if __os.environ.get('USE_DIFFUSERS_VAE','0') == '1':
         _device = __torch.device('cuda' if __torch.cuda.is_available() else 'cpu')
         return _vae_build_diffusers(_device)
     # fallback to original behavior if env not set
@@ -147,10 +154,9 @@ p.write_text(s, encoding="utf-8")
 print("[patch] vae2_1.py saved")
 PYPATCH1
 
-# --- ensure _video_vae imports os locally (robust)
+# --- ensure _video_vae imports os locally (robust, idempotent)
 ${PYBIN} - <<'PY'
 from pathlib import Path
-import re
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 if "def _video_vae(*_args, **_kwargs):" in s and "import os as __os" not in s:
@@ -166,9 +172,8 @@ else:
     print("[start][patch] _video_vae already robust or not found")
 PY
 
-
-# --- ensure 'import os' at very top of vae2_1.py (robust)
-python3 - <<'PY'
+# --- ensure 'import os' at very top of vae2_1.py (robust, idempotent)
+${PYBIN} - <<'PY'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
@@ -191,25 +196,31 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    s2 = re.sub(
-        r"load_model\(\s*checkpoint_dir\s*,\s*subfolder\s*=\s*config\.low_noise_checkpoint\s*\)",
-        "load_model(checkpoint_dir, subfolder=(os.environ.get('WAN_LOW_NOISE_SUBFOLDER') or getattr(config,'low_noise_checkpoint', None)))",
-        s
-    )
-    if s2 != s:
-        s = s2; changed = True
-
-    s2 = re.sub(
-        r"(self\.low_noise\s*=\s*)load_model\(\s*checkpoint_dir\s*,\s*subfolder\s*=\s*(.+?)\)",
-        r"_ln = (\2)\n\1load_model(checkpoint_dir, subfolder=_ln) if _ln else None",
-        s
-    )
-    if s2 != s:
-        s = s2; changed = True
-
+    # ensure import os is available
     if "import os" not in s:
-        s = s.replace("import torch", "import torch\nimport os", 1)
+        if "import torch" in s:
+            s = s.replace("import torch", "import torch\nimport os", 1)
+        else:
+            s = "import os\n" + s
         changed = True
+
+    # any 'subfolder=config.low_noise_checkpoint' -> env-aware optional
+    s2 = re.sub(
+        r"subfolder\s*=\s*config\.low_noise_checkpoint",
+        r"subfolder=(os.environ.get('WAN_LOW_NOISE_SUBFOLDER') or getattr(config,'low_noise_checkpoint',None))",
+        s
+    )
+    if s2 != s:
+        s = s2; changed = True
+
+    # wrap direct assignment to self.low_noise with _ln guard
+    s2 = re.sub(
+        r"(?P<ind>\s*)self\.low_noise\s*=\s*load_model\(\s*checkpoint_dir\s*,\s*subfolder\s*=\s*(.+?)\)",
+        r"\g<ind>_ln = (\2)\n\g<ind>self.low_noise = load_model(checkpoint_dir, subfolder=_ln) if _ln else None",
+        s
+    )
+    if s2 != s:
+        s = s2; changed = True
 
     if changed:
         p.write_text(s, encoding="utf-8")
