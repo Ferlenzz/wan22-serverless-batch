@@ -247,7 +247,7 @@ COPY handler.py /app/handler.py
 
 # ---------- стартовый скрипт ----------
 COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh
+RUN chmod 755 /app/start.sh && sed -i 's/\r$//' /app/start.sh
 
 # ---------- ENV ----------
 ENV RP_VOLUME=/runpod-volume
