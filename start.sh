@@ -10,12 +10,15 @@ PYBIN="${PYBIN:-python3}"
 export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 
 # -----------------------------------------------------------------------------
-# Тихий sitecustomize: делает WanI2V вызываемым и шмит generate(...)
+# ТИХИЙ sitecustomize.py:
+#  - Делает WanI2V вызываемым (__call__)
+#  - Шим для generate: корректно маппит prompt/img по ИМЕНАМ параметров
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY'
 from pathlib import Path
 code = r'''
-import builtins
+# НИЧЕГО не печатаем отсюда!
+import builtins, inspect
 
 def _patch_wani2v(mod):
     try:
@@ -33,16 +36,42 @@ def _patch_wani2v(mod):
                 raise TypeError("WanI2V is not callable and no known generate-like method was found")
             cls.__call__ = __call__
 
-        # 2) shim для generate: prompt/img -> позиционные, если args пусты
+        # 2) шим для generate: ПЕРЕДАЁМ ПО ИМЕНАМ, с учётом сигнатуры
         gen = getattr(cls, "generate", None)
-        if callable(gen) and not getattr(gen, "_shimmed", False):
+        if callable(gen) and not getattr(gen, "_shimmed_kwmap", False):
+            sig = inspect.signature(gen)
+            params = sig.parameters
+
             def _shim(self, *args, **kwargs):
+                # если пользователь не дал позиционных — соберём из kwargs стандартные поля
                 if not args:
+                    # извлекаем значения из входных kwargs (если есть)
                     prompt = kwargs.pop('prompt', kwargs.pop('input_prompt', ''))
                     img    = kwargs.pop('img', kwargs.pop('image', None))
-                    return gen(self, prompt, img, **kwargs)
+
+                    # подбираем подходящие имена из сигнатуры generate(...)
+                    call_kwargs = dict(kwargs)  # сохранить прочие
+
+                    if 'prompt' in params:
+                        call_kwargs['prompt'] = prompt
+                    elif 'input_prompt' in params:
+                        call_kwargs['input_prompt'] = prompt
+
+                    if img is not None:
+                        if 'img' in params:
+                            call_kwargs['img'] = img
+                        elif 'image' in params:
+                            call_kwargs['image'] = img
+                        elif 'x' in params:
+                            # если метод ждёт уже нормализованное x (список), завернём в список
+                            call_kwargs['x'] = [img]
+
+                    return gen(self, **call_kwargs)
+
+                # если есть позиционные — не трогаем (считаем, что порядок верный)
                 return gen(self, *args, **kwargs)
-            _shim._shimmed = True
+
+            _shim._shimmed_kwmap = True
             cls.generate = _shim
 
     except Exception:
@@ -66,7 +95,7 @@ def _hook(name, globals=None, locals=None, fromlist=(), level=0):
 builtins.__import__ = _hook
 '''
 Path("/app/sitecustomize.py").write_text(code, encoding="utf-8")
-print("[start] wrote ultra-quiet lazy sitecustomize.py (+generate shim)")
+print("[start] wrote ultra-quiet lazy sitecustomize.py (+generate kw shim)")
 PY
 
 # -----------------------------------------------------------------------------
@@ -257,8 +286,6 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # Найдём место, где внутри encode() делается ... self.model.encode(...).float().squeeze(0)
-    # и заменим на логику распаковки AutoencoderKLOutput.
     pat = re.compile(
         r"""(self\.model\.encode\(\s*u\.unsqueeze\(0\)\s*,\s*self\.scale\s*\)\.float\(\)\.squeeze\(0\))""",
         re.VERBOSE
@@ -273,7 +300,6 @@ else:
         )
         changed = True
     else:
-        # запасной вариант — если без .squeeze(0) или формат чуть другой
         pat2 = re.compile(
             r"""(self\.model\.encode\(\s*u\.unsqueeze\(0\)\s*,\s*self\.scale\s*\)\.float\(\))""",
             re.VERBOSE
@@ -296,7 +322,7 @@ else:
 PYPATCH_ENCODE
 
 # -----------------------------------------------------------------------------
-# image2video.py: поддержка boundary как dict (enabled/lower/upper) и как числа — INDENT-AWARE
+# image2video.py: boundary-handling и безопасные сравнения (как у тебя было)
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PYPATCH_BOUNDARY'
 from pathlib import Path
@@ -309,16 +335,13 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # Ищем строку вроде: boundary = self.boundary * self.num_train_timesteps
-    # (допускаем пробелы/их отсутствие вокруг '*')
     pat = re.compile(
         r'^(?P<ind>\s*)boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$',
         re.M
     )
-
     def repl(m):
-        ind  = m.group('ind')               # исходный базовый отступ
-        ind1 = ind + "    "                 # +1 уровень вложенности
+        ind  = m.group('ind')
+        ind1 = ind + "    "
         return (
             f"{ind}# normalize boundary (dict or scalar)\n"
             f"{ind}_b = self.boundary\n"
@@ -336,300 +359,61 @@ else:
             f"{ind1}except Exception:\n"
             f"{ind1}    boundary = None"
         )
-
     s2 = pat.sub(repl, s)
     if s2 != s:
         s = s2
         changed = True
-    else:
-        # запасной паттерн без пробелов вокруг '*'
-        pat2 = re.compile(
-            r'^(?P<ind>\s*)boundary\s*=\s*self\.boundary\*\s*self\.num_train_timesteps\s*$',
-            re.M
-        )
-        s3 = pat2.sub(repl, s)
-        if s3 != s:
-            s = s3
-            changed = True
 
-    if changed:
-        p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: boundary handling normalized (indent-aware)")
-    else:
-        print("[patch] image2video.py: boundary patch not applied (pattern not found) — maybe already patched?")
+    # safe compare if t.item() >= boundary
+    s = re.sub(
+        r'^(?P<ind>\s*)if\s+t\.item\(\)\s*>=\s*boundary\s*:\s*$',
+        lambda m: (
+            f"{m.group('ind')}# safe compare with boundary that may be None | int | (lo, up)\n"
+            f"{m.group('ind')}_b = boundary\n"
+            f"{m.group('ind')}if _b is None:\n"
+            f"{m.group('ind')}    _cond = False\n"
+            f"{m.group('ind')}elif isinstance(_b, tuple):\n"
+            f"{m.group('ind')}    try:\n"
+            f"{m.group('ind')}        _lo, _up = _b\n"
+            f"{m.group('ind')}    except Exception:\n"
+            f"{m.group('ind')}        _lo, _up = 0, int(_b[1]) if len(_b)>1 else 0\n"
+            f"{m.group('ind')}    _cond = (t.item() >= _up)\n"
+            f"{m.group('ind')}else:\n"
+            f"{m.group('ind')}    try:\n"
+            f"{m.group('ind')}        _cond = (t.item() >= int(_b))\n"
+            f"{m.group('ind')}    except Exception:\n"
+            f"{m.group('ind')}        _cond = False\n"
+            f"{m.group('ind')}if _cond:"
+        ),
+        s, flags=re.M
+    )
+
+    # safe ternary for sample_guide_scale
+    s = re.sub(
+        r'^(?P<ind>\s*)sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]\s*$',
+        lambda m: (
+            f"{m.group('ind')}_b = boundary\n"
+            f"{m.group('ind')}if _b is None:\n"
+            f"{m.group('ind')}    _cond = False\n"
+            f"{m.group('ind')}elif isinstance(_b, tuple):\n"
+            f"{m.group('ind')}    try:\n"
+            f"{m.group('ind')}        _lo, _up = _b\n"
+            f"{m.group('ind')}    except Exception:\n"
+            f"{m.group('ind')}        _lo, _up = 0, int(_b[1]) if len(_b)>1 else 0\n"
+            f"{m.group('ind')}    _cond = (t.item() >= _up)\n"
+            f"{m.group('ind')}else:\n"
+            f"{m.group('ind')}    try:\n"
+            f"{m.group('ind')}        _cond = (t.item() >= int(_b))\n"
+            f"{m.group('ind')}    except Exception:\n"
+            f"{m.group('ind')}        _cond = False\n"
+            f"{m.group('ind')}sample_guide_scale = guide_scale[1] if _cond else guide_scale[0]"
+        ),
+        s, flags=re.M
+    )
+
+    p.write_text(s, encoding="utf-8")
+    print("[patch] image2video.py: boundary handling & safe compares applied")
 PYPATCH_BOUNDARY
-
-# -----------------------------------------------------------------------------
-# image2video.py: безопасное сравнение с boundary (может быть None | int | tuple)
-# -----------------------------------------------------------------------------
-${PYBIN} - <<'PYPATCH_BOUNDARY_CMP'
-from pathlib import Path
-import re
-
-p = Path("/app/Wan2.2/wan/image2video.py")
-if not p.exists():
-    print("[patch][warn] not found:", p)
-else:
-    s = p.read_text(encoding="utf-8")
-    changed = False
-
-    # Ищем условие вида: if t.item() >= boundary:
-    pat = re.compile(r'^(?P<ind>\s*)if\s+t\.item\(\)\s*>=\s*boundary\s*:\s*$', re.M)
-
-    def repl(m):
-        ind  = m.group('ind')
-        ind1 = ind + "    "
-        return (
-            f"{ind}# safe compare with boundary that may be None | int | (lo, up)\n"
-            f"{ind}_b = boundary\n"
-            f"{ind}if _b is None:\n"
-            f"{ind1}_cond = False\n"
-            f"{ind}elif isinstance(_b, tuple):\n"
-            f"{ind1}try:\n"
-            f"{ind1}    _lo, _up = _b\n"
-            f"{ind1}except Exception:\n"
-            f"{ind1}    _lo, _up = 0, int(_b[1]) if len(_b)>1 else 0\n"
-            f"{ind1}_cond = (t.item() >= _up)\n"
-            f"{ind}else:\n"
-            f"{ind1}try:\n"
-            f"{ind1}    _cond = (t.item() >= int(_b))\n"
-            f"{ind1}except Exception:\n"
-            f"{ind1}    _cond = False\n"
-            f"{ind}if _cond:"
-        )
-
-    s2 = pat.sub(repl, s)
-    if s2 != s:
-        s = s2
-        changed = True
-
-    if changed:
-        p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: safe boundary comparison applied")
-    else:
-        print("[patch] image2video.py: comparison patch not applied (pattern not found) — maybe already patched?")
-PYPATCH_BOUNDARY_CMP
-
-# -----------------------------------------------------------------------------
-# image2video.py: безопасный выбор sample_guide_scale при boundary=None|int|tuple
-# -----------------------------------------------------------------------------
-${PYBIN} - <<'PYPATCH_GUIDE'
-from pathlib import Path, re
-
-p = Path("/app/Wan2.2/wan/image2video.py")
-if not p.exists():
-    print("[patch][warn] not found:", p)
-else:
-    s = p.read_text(encoding="utf-8")
-    changed = False
-
-    # Шаблоны тернарника: guide_scale[1] if t.item() >= boundary else guide_scale[0]
-    pat = re.compile(
-        r'^(?P<ind>\s*)sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*'
-        r'if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]\s*$',
-        re.M
-    )
-    def repl(m):
-        ind  = m.group('ind')
-        ind1 = ind + "    "
-        return (
-            f"{ind}# safe guide scale pick with boundary (None|int|(lo,up))\n"
-            f"{ind}_b = boundary\n"
-            f"{ind}if _b is None:\n"
-            f"{ind1}_cond = False\n"
-            f"{ind}elif isinstance(_b, tuple):\n"
-            f"{ind1}try:\n"
-            f"{ind1}    _lo, _up = _b\n"
-            f"{ind1}except Exception:\n"
-            f"{ind1}    _lo, _up = 0, int(_b[1]) if len(_b)>1 else 0\n"
-            f"{ind1}_cond = (t.item() >= _up)\n"
-            f"{ind}else:\n"
-            f"{ind1}try:\n"
-            f"{ind1}    _cond = (t.item() >= int(_b))\n"
-            f"{ind1}except Exception:\n"
-            f"{ind1}    _cond = False\n"
-            f"{ind}sample_guide_scale = guide_scale[1] if _cond else guide_scale[0]"
-        )
-
-    s2 = pat.sub(repl, s)
-    if s2 != s:
-        s = s2
-        changed = True
-    else:
-        # запасной — если без пробелов/переносов
-        pat2 = re.compile(
-            r'^(?P<ind>\s*)sample_guide_scale\s*=\s*guide_scale\[1\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[0\]\s*$',
-            re.M
-        )
-        s3 = pat2.sub(repl, s)
-        if s3 != s:
-            s = s3
-            changed = True
-
-    if changed:
-        p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: safe sample_guide_scale selection applied")
-    else:
-        print("[patch] image2video.py: guide-scale ternary not found (maybe already patched?)")
-PYPATCH_GUIDE
-
-# -----------------------------------------------------------------------------
-# image2video.py: ХЕЛПЕР для boundary + МАССОВЫЕ ЗАМЕНЫ (>=) и тернарника — универсально
-# -----------------------------------------------------------------------------
-${PYBIN} - <<'PYPATCH_BHELP'
-from pathlib import Path, re
-p = Path("/app/Wan2.2/wan/image2video.py")
-if not p.exists():
-    print("[patch][warn] not found:", p)
-else:
-    s = p.read_text(encoding="utf-8")
-    if "_wan_boundary_cond" not in s:
-        m = re.search(r"^(?:from\s+\S+\s+import\s+\S+|import\s+\S+).*$", s, re.M)
-        ins_at = m.end() if m else 0
-        helper = """
-
-# --- injected: safe boundary condition helper ---
-def _wan_boundary_cond(t, boundary):
-    \"\"\"Return True if current timestep t is considered '>= boundary'.
-    boundary can be: None | int/float | (lower, upper).\"\"\"
-    try:
-        ti = int(getattr(t, "item", lambda: t)())
-    except Exception:
-        try: ti = int(t)
-        except Exception: return False
-    _b = boundary
-    if _b is None:
-        return False
-    if isinstance(_b, tuple):
-        try:
-            _lo, _up = _b
-        except Exception:
-            try:
-                _up = int(_b[1])
-            except Exception:
-                return False
-        try:
-            return ti >= int(_up)
-        except Exception:
-            return False
-    try:
-        return ti >= int(_b)
-    except Exception:
-        try:
-            return ti >= int(float(_b))
-        except Exception:
-            return False
-# --- end helper ---
-"""
-        s = s[:ins_at] + helper + s[ins_at:]
-        p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: _wan_boundary_cond helper inserted")
-    else:
-        print("[patch] image2video.py: helper already exists")
-PYPATCH_BHELP
-
-${PYBIN} - <<'PYPATCH_BREWRITE'
-from pathlib import Path, re
-p = Path("/app/Wan2.2/wan/image2video.py")
-if not p.exists():
-    print("[patch][warn] not found:", p)
-else:
-    s = p.read_text(encoding="utf-8")
-    changed = False
-
-    pat_if = re.compile(r'^(?P<ind>\s*)if\s*t\.item\(\s*\)\s*>=\s*boundary\s*:\s*$', re.M)
-    s2 = pat_if.sub(lambda m: f"{m.group('ind')}if _wan_boundary_cond(t, boundary):", s)
-    if s2 != s:
-        s = s2; changed = True
-
-    pat_if2 = re.compile(r'^(?P<ind>\s*)if\s*t\s*>=\s*boundary\s*:\s*$', re.M)
-    s2 = pat_if2.sub(lambda m: f"{m.group('ind')}if _wan_boundary_cond(t, boundary):", s)
-    if s2 != s:
-        s = s2; changed = True
-
-    pat_tern = re.compile(
-        r'^(?P<ind>\s*)sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*'
-        r'if\s*t(?:\.item\(\s*\))?\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]\s*$',
-        re.M
-    )
-    def repl_tern(m):
-        ind = m.group('ind')
-        return f"{ind}sample_guide_scale = guide_scale[1] if _wan_boundary_cond(t, boundary) else guide_scale[0]"
-    s2 = pat_tern.sub(repl_tern, s)
-    if s2 != s:
-        s = s2; changed = True
-
-    if changed:
-        p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: boundary compares/ternary rewritten via helper")
-    else:
-        print("[patch] image2video.py: no boundary compare/ternary patterns found (maybe already patched)")
-PYPATCH_BREWRITE
-
-# -----------------------------------------------------------------------------
-# image2video.py: НОРМАЛИЗАЦИЯ КАНАЛОВ до C=48 — с правильным отступом (перманентно)
-# -----------------------------------------------------------------------------
-${PYBIN} - <<'PYPATCH_CH48'
-from pathlib import Path, re
-p = Path("/app/Wan2.2/wan/image2video.py")
-if not p.exists():
-    print("[patch][warn] image2video.py not found")
-else:
-    s = p.read_text(encoding="utf-8")
-    changed = False
-
-    # 0) helper _ensure_ch48 — вставим один раз сразу после "import os"
-    if "_ensure_ch48" not in s:
-        s = s.replace(
-            "import os",
-            "import os\n\n"
-            "def _ensure_ch48(u):\n"
-            "    import torch\n"
-            "    if u.dim() == 5:  # (B,C,T,H,W)\n"
-            "        B,C,T,H,W = u.shape\n"
-            "        if C == 48: return u\n"
-            "        if T == 48 and C != 48: return u.permute(0,2,1,3,4)\n"
-            "        if C > 48: return u[:, :48]\n"
-            "        if C < 48:\n"
-            "            reps = (48 + C - 1)//C\n"
-            "            return u.repeat(1, reps, 1, 1, 1)[:, :48]\n"
-            "        return u\n"
-            "    if u.dim() == 4:  # (C,T,H,W)\n"
-            "        C,T,H,W = u.shape\n"
-            "        if C == 48: return u\n"
-            "        if T == 48 and C != 48: return u.permute(1,0,2,3)\n"
-            "        if C > 48: return u[:48]\n"
-            "        if C < 48:\n"
-            "            reps = (48 + C - 1)//C\n"
-            "            return u.repeat(reps, 1, 1, 1)[:48]\n"
-            "        return u\n"
-            "    return u\n",
-            1
-        )
-        changed = True
-
-    # 1) удалить любые старые вставки x = [ _ensure_ch48(u) for u in x ]
-    s2 = re.sub(r'(?m)^\s*x\s*=\s*\[\s*_ensure_ch48\(\s*u\s*\)\s*for\s*u\s*in\s*x\s*\]\s*$', '', s)
-    if s2 != s:
-        s = s2
-        changed = True
-
-    # 2) вставить нормализацию ПЕРЕД первой строкой "noise_pred_cond = model(" с тем же отступом
-    pat = re.compile(r'^(?P<ind>\s*)noise_pred_cond\s*=\s*model\(', re.M)
-    def repl(m):
-        ind = m.group('ind')
-        return f"{ind}x = [ _ensure_ch48(u) for u in x ]\n{ind}noise_pred_cond = model("
-    s2, n = pat.subn(repl, s, count=1)
-    if n > 0 and s2 != s:
-        s = s2
-        changed = True
-
-    if changed:
-        p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: ch48 helper added and normalization inserted with correct indent")
-    else:
-        print("[patch] image2video.py: ch48 normalization already present")
-PYPATCH_CH48
 
 # -----------------------------------------------------------------------------
 # Запуск хэндлера
