@@ -108,25 +108,26 @@ def _get_wan_call(obj):
     raise TypeError("WanI2V is not callable and no known generate method found")
 
 def _filter_and_remap_kwargs(fn, kw: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep only params supported by fn; remap common aliases."""
+    """Фильтруем keyword-параметры под сигнатуру fn и мапим синонимы."""
     sig = signature(fn)
     params = sig.parameters
 
     def has(name: str) -> bool:
-        return name in params and params[name].kind in (
-            Parameter.POSITIONAL_OR_KEYWORD,
-            Parameter.KEYWORD_ONLY
-        )
+        p = params.get(name)
+        return p is not None and p.kind in (Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY)
 
-    out = {}
+    out: Dict[str, Any] = {}
 
-    # image arg
-    if "img" in kw or "image" in kw:
-        v = kw.get("img", kw.get("image"))
-        out["image" if has("image") else ("img" if has("img") else None)] = v
+    # image/img → keyword, если метод это поддерживает как keyword
+    v_img = kw.get("img", kw.get("image"))
+    if v_img is not None:
+        if has("image"):
+            out["image"] = v_img
+        elif has("img"):
+            out["img"] = v_img
 
     # width/height
-    for k in ("width","height"):
+    for k in ("width", "height"):
         if k in kw and has(k):
             out[k] = kw[k]
 
@@ -138,37 +139,67 @@ def _filter_and_remap_kwargs(fn, kw: Dict[str, Any]) -> Dict[str, Any]:
             out["num_inference_steps"] = kw["steps"]
 
     # guidance scale (cfg)
-    if "guidance_scale" in kw or "cfg" in kw or "cfg_scale" in kw:
-        v = kw.get("guidance_scale", kw.get("cfg", kw.get("cfg_scale")))
+    v_cfg = kw.get("guidance_scale", kw.get("cfg", kw.get("cfg_scale")))
+    if v_cfg is not None:
         if has("guidance_scale"):
-            out["guidance_scale"] = v
+            out["guidance_scale"] = v_cfg
         elif has("scale"):
-            out["scale"] = v
+            out["scale"] = v_cfg
 
     # frames / length
-    if "frame_num" in kw or "length" in kw or "frames" in kw or "num_frames" in kw:
-        v = kw.get("frame_num", kw.get("length", kw.get("frames", kw.get("num_frames"))))
+    v_frames = kw.get("frame_num", kw.get("length", kw.get("frames", kw.get("num_frames"))))
+    if v_frames is not None:
         for name in ("frame_num","num_frames","frames","length"):
             if has(name):
-                out[name] = v
+                out[name] = v_frames
                 break
 
-    # prompt — только если поддерживается
-    if "prompt" in kw and has("prompt"):
-        out["prompt"] = kw["prompt"]
+    # prompt → только если метод явно принимает keyword с таким именем
+    if "prompt" in kw:
+        if has("prompt"):
+            out["prompt"] = kw["prompt"]
+        elif has("input_prompt"):
+            out["input_prompt"] = kw["prompt"]
 
-    # fps — если поддерживается
+    # fps (если поддерживается keyword'ом)
     if "fps" in kw and has("fps"):
         out["fps"] = kw["fps"]
 
-    # фильтруем None ключ (если image/img оба не поддерживаются)
-    out = {k:v for k,v in out.items() if k is not None}
     return out
 
 def _invoke_wan(obj, **kw):
+    """Вызывает метод модели, поддерживая позиционно-обязательные аргументы."""
     fn = _get_wan_call(obj)
-    filtered = _filter_and_remap_kwargs(fn, kw)
-    return fn(**filtered)
+    sig = signature(fn)
+    params = list(sig.parameters.values())
+
+    # Подготовим кандидатов
+    img_val = kw.get("img", kw.get("image"))
+    prompt_val = kw.get("prompt", kw.get("input_prompt"))
+
+    # 1) Соберём позиционные аргументы (POSITIONAL_ONLY)
+    args = []
+    for p in params:
+        if p.kind is Parameter.POSITIONAL_ONLY:
+            if p.name in ("input_prompt", "prompt", "text"):
+                args.append(prompt_val)
+            elif p.name in ("img", "image"):
+                args.append(img_val)
+            else:
+                # другой позиционный — попытаемся взять из kw по имени
+                args.append(kw.get(p.name))
+        elif p.kind in (Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY, Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD):
+            break
+
+    # Проверка наличия обязательных позиционных без default
+    need_pos = [p for p in params if p.kind is Parameter.POSITIONAL_ONLY and p.default is Parameter.empty]
+    if any(a is None for a in args[:len(need_pos)]):
+        raise TypeError("Required positional-only params are missing; make sure to pass image_base64 and (optionally) prompt.")
+
+    # 2) Именованные (keyword) — фильтруем и мапим
+    kwargs = _filter_and_remap_kwargs(fn, kw)
+
+    return fn(*args, **kwargs)
 
 class _WanI2VProxy:
     def __init__(self, obj): self._obj = obj
