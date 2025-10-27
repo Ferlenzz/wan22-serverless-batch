@@ -147,6 +147,18 @@ p.write_text(s, encoding="utf-8")
 print("[patch] vae2_1.py saved")
 PYPATCH1
 
+# --- ensure 'import os' at very top of vae2_1.py (robust)
+python3 - <<'PY'
+from pathlib import Path
+p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
+s = p.read_text(encoding="utf-8")
+if not s.lstrip().startswith("import os") and "import os" not in s:
+    p.write_text("import os\n" + s, encoding="utf-8")
+    print("[start][patch] forced 'import os' at top of vae2_1.py")
+else:
+    print("[start][patch] 'import os' already present (top or elsewhere)")
+PY
+
 # --- Make low_noise_checkpoint optional (ENV WAN_LOW_NOISE_SUBFOLDER or None)
 ${PYBIN} - <<'PYPATCH2'
 from pathlib import Path
