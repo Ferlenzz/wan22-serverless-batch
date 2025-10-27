@@ -98,8 +98,21 @@ def _arr_to_mp4_and_b64(arr: np.ndarray, out_path: Path, fps: int = 24) -> str:
 
 # ---- make WanI2V safely callable ----
 def _get_wan_call(obj):
+    # unwrap our proxy to the real WanI2V if needed
+    try:
+        from engine import _WanI2VProxy  # self-import safe if same module name
+        if isinstance(obj, _WanI2VProxy):
+            obj = obj._obj
+    except Exception:
+        pass
+
     call = getattr(obj, "__call__", None)
     if callable(call):
+        # prefer a real generate/infer if present; __call__ often hides signature
+        for name in ("generate","infer","forward","run","predict","sample"):
+            fn = getattr(obj, name, None)
+            if callable(fn):
+                return fn
         return call
     for name in ("generate","infer","forward","run","predict","sample"):
         fn = getattr(obj, name, None)
@@ -168,7 +181,7 @@ def _filter_and_remap_kwargs(fn, kw: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 def _invoke_wan(obj, **kw):
-    """Вызывает метод модели, поддерживая позиционно-обязательные аргументы."""
+    """Вызывает метод модели, поддерживая позиционно-обязательные аргументы и не теряя img/prompt."""
     fn = _get_wan_call(obj)
     sig = signature(fn)
     params = list(sig.parameters.values())
@@ -198,6 +211,14 @@ def _invoke_wan(obj, **kw):
 
     # 2) Именованные (keyword) — фильтруем и мапим
     kwargs = _filter_and_remap_kwargs(fn, kw)
+
+    # 3) СКВОЗНАЯ передача img/prompt — чтобы шины/обёртки увидели их даже без сигнатуры
+    if img_val is not None:
+        kwargs.setdefault("img", img_val)
+        kwargs.setdefault("image", img_val)
+    if prompt_val is not None:
+        kwargs.setdefault("prompt", prompt_val)
+        kwargs.setdefault("input_prompt", prompt_val)
 
     return fn(*args, **kwargs)
 
