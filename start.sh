@@ -407,6 +407,68 @@ else:
         print("[patch] image2video.py: comparison patch not applied (pattern not found) — maybe already patched?")
 PYPATCH_BOUNDARY_CMP
 
+# -----------------------------------------------------------------------------
+# image2video.py: безопасный выбор sample_guide_scale при boundary=None|int|tuple
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PYPATCH_GUIDE'
+from pathlib import Path, re
+
+p = Path("/app/Wan2.2/wan/image2video.py")
+if not p.exists():
+    print("[patch][warn] not found:", p)
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # Шаблоны тернарника: guide_scale[1] if t.item() >= boundary else guide_scale[0]
+    pat = re.compile(
+        r'^(?P<ind>\s*)sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*'
+        r'if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]\s*$',
+        re.M
+    )
+    def repl(m):
+        ind  = m.group('ind')
+        ind1 = ind + "    "
+        return (
+            f"{ind}# safe guide scale pick with boundary (None|int|(lo,up))\n"
+            f"{ind}_b = boundary\n"
+            f"{ind}if _b is None:\n"
+            f"{ind1}_cond = False\n"
+            f"{ind}elif isinstance(_b, tuple):\n"
+            f"{ind1}try:\n"
+            f"{ind1}    _lo, _up = _b\n"
+            f"{ind1}except Exception:\n"
+            f"{ind1}    _lo, _up = 0, int(_b[1]) if len(_b)>1 else 0\n"
+            f"{ind1}_cond = (t.item() >= _up)\n"
+            f"{ind}else:\n"
+            f"{ind1}try:\n"
+            f"{ind1}    _cond = (t.item() >= int(_b))\n"
+            f"{ind1}except Exception:\n"
+            f"{ind1}    _cond = False\n"
+            f"{ind}sample_guide_scale = guide_scale[1] if _cond else guide_scale[0]"
+        )
+
+    s2 = pat.sub(repl, s)
+    if s2 != s:
+        s = s2
+        changed = True
+    else:
+        # запасной — если без пробелов/переносов
+        pat2 = re.compile(
+            r'^(?P<ind>\s*)sample_guide_scale\s*=\s*guide_scale\[1\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[0\]\s*$',
+            re.M
+        )
+        s3 = pat2.sub(repl, s)
+        if s3 != s:
+            s = s3
+            changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: safe sample_guide_scale selection applied")
+    else:
+        print("[patch] image2video.py: guide-scale ternary not found (maybe already patched?)")
+PYPATCH_GUIDE
 
 # -----------------------------------------------------------------------------
 # Запуск хэндлера
