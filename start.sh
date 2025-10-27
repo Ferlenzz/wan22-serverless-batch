@@ -15,7 +15,7 @@ except Exception as e:
     print("[runtime] torch not importable:", e)
 PYINFO
 
-# --- ensure diffusers >= 0.33 (WAN support)
+# --- ensure diffusers >= 0.33 (WAN support present in newer versions)
 python3 - <<'PYDIF'
 import subprocess, sys
 def run(*args): subprocess.check_call([sys.executable, "-m", "pip", *args])
@@ -31,7 +31,7 @@ except Exception:
     run("install","-q","--upgrade","diffusers>=0.33.0")
 PYDIF
 
-# --- pin scientific stack (avoid NumPy 2.x ABI breaks)
+# --- pin scientific stack (avoid NumPy 2.x ABI breaks etc.)
 echo "[start][fix] pinning scientific stack (numpy/scipy/sklearn/numba) ..."
 python3 - <<'PYPIN'
 import subprocess, sys
@@ -61,7 +61,7 @@ if [ "${USE_DIFFUSERS_VAE:-0}" = "1" ]; then
   fi
 fi
 
-# --- backend-injection patch (separate script)
+# --- backend-injection patch (separate script to avoid heredoc quoting issues)
 cat >/tmp/patch_vae.py <<'PY'
 from pathlib import Path
 import os, importlib, inspect
@@ -168,36 +168,36 @@ PY
 
 python3 /tmp/patch_vae.py
 
+# --- guard native .pth load (indent-safe replacement; no f-strings)
 python3 - <<'PY'
-from pathlib import Path, re
+from pathlib import Path
+import re, os
 p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
-s = p.read_text(encoding="utf-8")
+if not p.exists():
+    print("[guard][warn] file not found:", p)
+else:
+    s = p.read_text(encoding="utf-8")
+    if "import os" not in s:
+        s = s.replace("import torch", "import torch\nimport os", 1)
 
-# 1) гарантируем import os рядом с import torch
-if "import os" not in s:
-    s = s.replace("import torch", "import torch\nimport os", 1)
-
-# 2) заменяем исходную строчку load_state_dict(...) на корректно ИНДЕНТИРОВАННЫЙ блок
-pat = re.compile(r'^(\s*)missing,\s*mism\s*=\s*_load_filtered_state_dict\(\s*model\s*,\s*torch\.load\(\s*pretrained_path\s*,\s*map_location\s*=\s*device\s*\)\s*\)\s*$', re.M)
-
-def repl(m):
-    base = m.group(1)  # фактический отступ функции
-    ind  = base + "    "
-    return (
-        f"{base}if os.environ.get('USE_DIFFUSERS_VAE','0')=='1' or not os.path.isfile(pretrained_path):\n"
-        f"{ind}print(f\"[VAE] skip .pth load (USE_DIFFUSERS_VAE or missing file): {pretrained_path}\")\n"
-        f"{base}else:\n"
-        f"{ind}missing, mism = _load_filtered_state_dict(model, torch.load(pretrained_path, map_location=device))"
-    )
-
-s2, n = pat.subn(repl, s)
-print(f"[patch] guarded .pth load occurrences replaced: {n}")
-p.write_text(s2, encoding="utf-8")
+    pat = re.compile(r'^(?P<ind>\s*)missing,\s*mism\s*=\s*_load_filtered_state_dict\(\s*model\s*,\s*torch\.load\(\s*pretrained_path.*$', re.M)
+    def repl(m):
+        ind  = m.group('ind')
+        ind1 = ind + "    "
+        lines = [
+            f"{ind}if os.environ.get('USE_DIFFUSERS_VAE','0')=='1' or not os.path.isfile(pretrained_path):",
+            f"{ind1}print('[VAE] skip .pth load (USE_DIFFUSERS_VAE or missing file):', pretrained_path)",
+            f"{ind}else:",
+            f"{ind1}missing, mism = _load_filtered_state_dict(model, torch.load(pretrained_path, map_location=device))",
+        ]
+        return "\n".join(lines)
+    s2, n = pat.subn(repl, s)
+    if n > 0:
+        p.write_text(s2, encoding="utf-8")
+        print(f"[guard] wrapped .pth load in {p} (occurrences: {n})")
+    else:
+        print("[guard] target .pth load line not found — maybe already patched")
 PY
-
-# очистить кеши bytecode
-find /app/Wan2.2 -name '__pycache__' -type d -exec rm -rf {} +
-
 
 echo "[start] Launching handler..."
 exec python3 -u /app/handler.py
