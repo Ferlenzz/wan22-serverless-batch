@@ -9,22 +9,19 @@ PYBIN="${PYBIN:-python3}"
 # -----------------------------------------------------------------------------
 export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 
-# -----------------------------------------------------------------------------
-# Пишем УЛЬТРА-ТИХИЙ и «ленивый» sitecustomize.py:
-#  - никаких print внутри файла
-#  - не делает ранних импортов wan.*, только перехватывает __import__
-#  - когда кто-то импортирует wan.image2video, молча навешивает __call__ на WanI2V
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY'
 from pathlib import Path
 code = r'''
-# absolutely no prints here; loaded before everything else
 import builtins
 
 def _patch_wani2v(mod):
     try:
         cls = getattr(mod, "WanI2V", None)
-        if cls is not None and not hasattr(cls, "__call__"):
+        if cls is None:
+            return
+
+        # 1) сделать класс вызываемым (__call__), делегируя на generate/infer/…
+        if not hasattr(cls, "__call__"):
             def __call__(self, *args, **kwargs):
                 for name in ("generate","infer","forward","run","predict","sample"):
                     fn = getattr(self, name, None)
@@ -32,6 +29,19 @@ def _patch_wani2v(mod):
                         return fn(*args, **kwargs)
                 raise TypeError("WanI2V is not callable and no known generate-like method was found")
             cls.__call__ = __call__
+
+        # 2) shim для generate: prompt/img -> позиционные, если args пусты
+        gen = getattr(cls, "generate", None)
+        if callable(gen) and not getattr(gen, "_shimmed", False):
+            def _shim(self, *args, **kwargs):
+                if not args:
+                    prompt = kwargs.pop('prompt', kwargs.pop('input_prompt', ''))
+                    img    = kwargs.pop('img', kwargs.pop('image', None))
+                    return gen(self, prompt, img, **kwargs)
+                return gen(self, *args, **kwargs)
+            _shim._shimmed = True
+            cls.generate = _shim
+
     except Exception:
         # fail-quietly
         pass
@@ -39,21 +49,21 @@ def _patch_wani2v(mod):
 _orig_import = builtins.__import__
 def _hook(name, globals=None, locals=None, fromlist=(), level=0):
     m = _orig_import(name, globals, locals, fromlist, level)
-    # patch only AFTER wan.image2video is actually imported by user code
     try:
+        # Патчим только ПОСЛЕ фактического импорта wan.image2video
         if name == "wan.image2video" or (name == "wan" and ("image2video" in (fromlist or ()) or fromlist == ("*",))):
             import sys as _sys
             mod = _sys.modules.get("wan.image2video")
             if mod is not None:
                 _patch_wani2v(mod)
     except Exception:
-        pass  # never print here
+        pass  # никогда ничего не печатаем
     return m
 
 builtins.__import__ = _hook
 '''
 Path("/app/sitecustomize.py").write_text(code, encoding="utf-8")
-print("[start] wrote ultra-quiet lazy sitecustomize.py")
+print("[start] wrote ultra-quiet lazy sitecustomize.py (+generate shim)")
 PY
 
 # -----------------------------------------------------------------------------
@@ -76,7 +86,7 @@ for k in ("USE_DIFFUSERS_VAE","WAN_VAE_REPO","WAN_VAE_SUBFOLDER","WAN_VAE_FILENA
 PYINFO
 
 # -----------------------------------------------------------------------------
-# Гарантируем diffusers >= 0.35 (не даунгрейдим)
+# Гарантируем diffusers >= 0.35
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PYDIF'
 import sys, subprocess
