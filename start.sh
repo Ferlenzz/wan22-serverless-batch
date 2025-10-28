@@ -478,35 +478,83 @@ PY_BOUNDARY_MULTILINE
 
 # -----------------------------------------------------------------------------
 # image2video.py: MASK FIX — выровнять число каналов маски до кратного 4
-# и синхронизировать frame_num, прежде чем делать view(..., //4, 4, ...)
+# и синхронизировать frame_num, прежде чем делать view(... //4, 4, ...)
+# (ремейк с сохранением исходного отступа)
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_MASK_FIX'
-from pathlib import Path, re
+from pathlib import Path
+import re
+
 p = Path("/app/Wan2.2/wan/image2video.py")
 if not p.exists():
     print("[patch][warn] image2video.py not found for mask-fix")
 else:
     s = p.read_text(encoding="utf-8")
-    # Ищем строку: msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-    pat = re.compile(r"""msk\s*=\s*msk\.view\(\s*1\s*,\s*msk\.shape\[1\]\s*//\s*4\s*,\s*4\s*,\s*lat_h\s*,\s*lat_w\s*\)""")
-    if pat.search(s) and "##__MASK_CHANNEL_GUARD__" not in s:
-        s = pat.sub(
-            "##__MASK_CHANNEL_GUARD__\n"
-            "_C = int(msk.shape[1])\n"
-            "if (_C % 4) != 0:\n"
-            "    _C_trim = _C - (_C % 4)\n"
-            "    print(f\"[mask] trim channels: {_C} -> {_C_trim} (not divisible by 4)\")\n"
-            "    msk = msk[:, :_C_trim, ...]\n"
-            "    _C = _C_trim\n"
-            "try:\n"
-            "    self.frame_num = int(_C // 4)\n"
-            "except Exception:\n"
-            "    pass\n"
-            "msk = msk.view(1, _C // 4, 4, lat_h, lat_w)", s)
-        p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: mask channels guard added")
+    # Паттерн: захватываем ведущий отступ строки с view(...)
+    pat = re.compile(
+        r"(?P<ind>^[ \t]*)msk\s*=\s*msk\.view\(\s*1\s*,\s*msk\.shape\[1\]\s*//\s*4\s*,\s*4\s*,\s*lat_h\s*,\s*lat_w\s*\)",
+        re.M
+    )
+
+    def repl(m):
+        ind = m.group("ind")
+        return (
+            f"{ind}##__MASK_CHANNEL_GUARD__\n"
+            f"{ind}_C = int(msk.shape[1])\n"
+            f"{ind}if (_C % 4) != 0:\n"
+            f"{ind}    _C_trim = _C - (_C % 4)\n"
+            f'{ind}    print(f"[mask] trim channels: {{_C}} -> {{_C_trim}} (not divisible by 4)")\n'
+            f"{ind}    msk = msk[:, :_C_trim, ...]\n"
+            f"{ind}    _C = _C_trim\n"
+            f"{ind}try:\n"
+            f"{ind}    self.frame_num = int(_C // 4)\n"
+            f"{ind}except Exception:\n"
+            f"{ind}    pass\n"
+            f"{ind}msk = msk.view(1, _C // 4, 4, lat_h, lat_w)"
+        )
+
+    changed = False
+    if "##__MASK_CHANNEL_GUARD__" in s:
+        # Нормализуем уже вставленный блок по его текущему отступу (строка с маркером задаёт ind)
+        guard_pat = re.compile(r"(?P<ind>^[ \t]*)##__MASK_CHANNEL_GUARD__\s*$", re.M)
+        m = guard_pat.search(s)
+        if m:
+            ind = m.group("ind")
+            # Пересоберём блок до следующего view(...), на всякий
+            block_pat = re.compile(
+                r"^[ \t]*##__MASK_CHANNEL_GUARD__.*?msk\s*=\s*msk\.view\(1,\s*_C\s*//\s*4\s*,\s*4\s*,\s*lat_h\s*,\s*lat_w\)",
+                re.M | re.S
+            )
+            s = block_pat.sub(
+                (
+                    f"{ind}##__MASK_CHANNEL_GUARD__\n"
+                    f"{ind}_C = int(msk.shape[1])\n"
+                    f"{ind}if (_C % 4) != 0:\n"
+                    f"{ind}    _C_trim = _C - (_C % 4)\n"
+                    f'{ind}    print(f"[mask] trim channels: {{_C}} -> {{_C_trim}} (not divisible by 4)")\n'
+                    f"{ind}    msk = msk[:, :_C_trim, ...]\n"
+                    f"{ind}    _C = _C_trim\n"
+                    f"{ind}try:\n"
+                    f"{ind}    self.frame_num = int(_C // 4)\n"
+                    f"{ind}except Exception:\n"
+                    f"{ind}    pass\n"
+                    f"{ind}msk = msk.view(1, _C // 4, 4, lat_h, lat_w)"
+                ),
+                s,
+                count=1
+            )
+            changed = True
     else:
-        print("[patch] image2video.py: mask guard already present or pattern not found")
+        s2 = pat.sub(repl, s, count=1)
+        if s2 != s:
+            s = s2
+            changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: mask channels guard inserted/re-indented")
+    else:
+        print("[patch] image2video.py: mask guard unchanged (pattern not found)")
 PY_MASK_FIX
 
 # -----------------------------------------------------------------------------
