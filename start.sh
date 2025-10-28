@@ -1134,6 +1134,69 @@ def _ensure_latent_channels(sample, frame_num:int):
 PY_LATENT_CHAN_SYNC
 
 # -----------------------------------------------------------------------------
+# fm_solvers_unipc.py: выровнять каналы sample к model_output в convert_model_output
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_SCHED_CHAN_GUARD'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/utils/fm_solvers_unipc.py")
+if not p.exists():
+    print("[patch][warn] fm_solvers_unipc.py not found for scheduler channel guard")
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # 1) helper один раз
+    if "_align_channels_like(" not in s:
+        helper = r"""
+# --- inserted: align channels of A to B (trim/pad with noise) ---
+def _align_channels_like(a, b):
+    import torch
+    if not hasattr(a, "shape") or not hasattr(b, "shape"):
+        return a
+    if a.dim() < 2 or b.dim() < 2:
+        return a
+    ca = int(a.shape[1]); cb = int(b.shape[1])
+    if ca == cb:
+        return a
+    tail = a.shape[2:]
+    if ca > cb:
+        return a[:, :cb, ...]
+    # pad with fresh noise matching device/dtype
+    pad = torch.randn((a.shape[0], cb - ca, *tail), device=a.device, dtype=a.dtype)
+    return torch.cat([a, pad], dim=1)
+# --- end inserted ---
+"""
+        # вставим перед первой функцией
+        idx = s.find("def ")
+        if idx == -1:
+            idx = len(s)
+        s = s[:idx] + helper + s[idx:]
+        changed = True
+
+    # 2) в convert_model_output, перед x0_pred = sample - sigma_t * model_output
+    pat = re.compile(
+        r"(?P<ind>^[ \t]*)x0_pred\s*=\s*sample\s*-\s*sigma_t\s*\*\s*model_output\s*$",
+        re.M
+    )
+    def repl(m):
+        ind = m.group("ind")
+        return (
+f"""{ind}# __CHAN_GUARD__: align sample channels to model_output
+{ind}sample = _align_channels_like(sample, model_output)
+{ind}x0_pred = sample - sigma_t * model_output"""
+        )
+    s2, n = pat.subn(repl, s, count=1)
+    if n > 0:
+        s = s2; changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] fm_solvers_unipc.py: convert_model_output channel guard installed")
+    else:
+        print("[patch] fm_solvers_unipc.py: channel guard already present or pattern not found")
+PY_SCHED_CHAN_GUARD
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
