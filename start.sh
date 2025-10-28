@@ -4,19 +4,14 @@ set -euo pipefail
 echo "[start] STARTING start.sh"
 PYBIN="${PYBIN:-python3}"
 
-# -----------------------------------------------------------------------------
-# PYTHONPATH: и /app (для sitecustomize.py), и /app/Wan2.2 (для wan.*)
-# -----------------------------------------------------------------------------
+# PYTHONPATH: и /app (для sitecustomize.py), и /app/Wan2.2 (для wan)
 export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 
-# -----------------------------------------------------------------------------
-# sitecustomize.py (тихий):
-#  - делает WanI2V вызываемым (__call__)
+# sitecustomize.py:
+#  - WanI2V вызываемым (__call__)
 #  - shim для generate: маппит prompt/img в именованные параметры
 #  - WAN_FORCE_BOUNDARY_OFF=1 мягко отключает boundary в рантайме
 #  - WAN_FORCE_FRAMES=N: жёстко выставляет кадры в объекте/конфиге + пробрасывает kw
-# -----------------------------------------------------------------------------
-
 ${PYBIN} - <<'PY_SITE'
 from pathlib import Path
 code = r'''
@@ -145,10 +140,7 @@ Path("/app/sitecustomize.py").write_text(code, encoding="utf-8")
 print("[start] wrote sitecustomize.py (safe wraps: shim + boundary OFF + frames)")
 PY_SITE
 
-
-# -----------------------------------------------------------------------------
 # Диагностика
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_INFO'
 import platform, os
 try:
@@ -165,9 +157,7 @@ for k in ("USE_DIFFUSERS_VAE","WAN_VAE_REPO","WAN_VAE_SUBFOLDER","WAN_VAE_FILENA
         print(f"[env] {k} = {v}")
 PY_INFO
 
-# -----------------------------------------------------------------------------
-# Гарантируем diffusers >= 0.35 (не даунгрейдим)
-# -----------------------------------------------------------------------------
+# diffusers >= 0.35
 ${PYBIN} - <<'PY_DIF'
 import sys, subprocess
 from packaging.version import Version
@@ -183,10 +173,7 @@ except Exception:
     print("[start] installing diffusers>=0.35.0 ...")
     run("install","-q","--upgrade","diffusers>=0.35.0")
 PY_DIF
-
-# -----------------------------------------------------------------------------
 # vae2_1.py: diffusers VAE backend + hard override _video_vae + guard .pth + encode unwrap
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_VAE'
 from pathlib import Path
 import re, os
@@ -303,9 +290,7 @@ def _video_vae(*_args, **_kwargs):
     p.write_text(s, encoding="utf-8")
 PY_VAE
 
-# -----------------------------------------------------------------------------
-# image2video.py: low/high_noise_checkpoint опциональны (ENV-aware)
-# -----------------------------------------------------------------------------
+# image2video.py: low/high_noise_checkpoint опциональны
 ${PYBIN} - <<'PY_NOISE'
 from pathlib import Path
 import re, os
@@ -344,9 +329,7 @@ else:
     print("[patch][warn] not found:", p)
 PY_NOISE
 
-# -----------------------------------------------------------------------------
-# image2video.py: глобальный безопасный патч boundary (normalize + compare helper)
-# -----------------------------------------------------------------------------
+# image2video.py: глобальный патч boundary (normalize + compare helper)
 ${PYBIN} - <<'PY_BOUNDARY'
 from pathlib import Path
 import re
@@ -432,9 +415,7 @@ def _ge_boundary(t_item, boundary):
         print("[patch] image2video.py: boundary already patched")
 PY_BOUNDARY
 
-# -----------------------------------------------------------------------------
-# ДОП. патч: многострочные варианты сравнения/тернарника с boundary
-# -----------------------------------------------------------------------------
+#патч: многострочные варианты сравнения/тернарника с boundary
 ${PYBIN} - <<'PY_BOUNDARY_MULTILINE'
 from pathlib import Path
 import re
@@ -476,11 +457,9 @@ else:
         print("[patch] image2video.py: multiline patterns not found (maybe already patched)")
 PY_BOUNDARY_MULTILINE
 
-# -----------------------------------------------------------------------------
 # image2video.py: MASK FIX — выровнять число каналов маски до кратного 4
-# и синхронизировать frame_num, прежде чем делать view(... //4, 4, ...)
+# синхронизировать frame_num, перед view(... //4, 4, ...)
 # (ремейк с сохранением исходного отступа)
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_MASK_FIX'
 from pathlib import Path
 import re
@@ -515,12 +494,10 @@ else:
 
     changed = False
     if "##__MASK_CHANNEL_GUARD__" in s:
-        # Нормализуем уже вставленный блок по его текущему отступу (строка с маркером задаёт ind)
         guard_pat = re.compile(r"(?P<ind>^[ \t]*)##__MASK_CHANNEL_GUARD__\s*$", re.M)
         m = guard_pat.search(s)
         if m:
             ind = m.group("ind")
-            # Пересоберём блок до следующего view(...), на всякий
             block_pat = re.compile(
                 r"^[ \t]*##__MASK_CHANNEL_GUARD__.*?msk\s*=\s*msk\.view\(1,\s*_C\s*//\s*4\s*,\s*4\s*,\s*lat_h\s*,\s*lat_w\)",
                 re.M | re.S
@@ -559,8 +536,7 @@ PY_MASK_FIX
 
 # -----------------------------------------------------------------------------
 # model.py: CHANNEL GUARD — привести каналы к 4*frame_num (напр. 48 при 12 кадрах)
-# до patch_embedding, чтобы Conv3d(48, …) не падал на 68 каналах
-# -----------------------------------------------------------------------------
+# patch_embedding, чтобы Conv3d(48, …)
 ${PYBIN} - <<'PY_CHAN_GUARD'
 from pathlib import Path
 import re
@@ -572,11 +548,9 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) Вставим helper (один раз, идемпотентно)
     if "_ensure_frame_channels(" not in s:
         helper = r"""
 
-# --- inserted: ensure frame channels match 4*frame_num ---
 def _ensure_frame_channels(self, u):
     # u: Tensor [C, H, W] (стек каналов латента)
     import torch
@@ -599,17 +573,14 @@ def _ensure_frame_channels(self, u):
     if C > targetC:
         print(f"[chan] trim channels: {C} -> {targetC}")
         return u[:targetC, ...]
-    # C < targetC: дополним последним каналом
     rep = targetC - C
     return torch.cat([u, u[-1:, ...].repeat(rep, 1, 1)], dim=0)
-# --- end inserted ---
 """
         idx = s.find("class ")
         if idx != -1:
             s = s[:idx] + helper + s[idx:]
             changed = True
 
-    # 2) Перед patch_embedding пропустим через гард
     # x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
     pat = re.compile(r"x\s*=\s*\[self\.patch_embedding\(\s*u\.unsqueeze\(0\)\s*\)\s*for\s+u\s+in\s+x\s*\]")
     if pat.search(s) and "_ensure_frame_channels(self, u).unsqueeze(0)" not in s:
@@ -623,10 +594,7 @@ def _ensure_frame_channels(self, u):
         print("[patch] model.py: channel guard already present or pattern not found")
 PY_CHAN_GUARD
 
-# -----------------------------------------------------------------------------
-# attention.py: SDPA fallback (фикс отступа внутри ветки else)
 #   - заменяем 'assert FLASH_ATTN_2_AVAILABLE' на корректно ИНДЕНТИРОВАННЫЙ fallback
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_ATTN_FALLBACK_FIX'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/modules/attention.py")
@@ -636,7 +604,6 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) Вариант без комментария
     pat = re.compile(r"(?m)^(?P<ind>[ \t]*)assert[ \t]+FLASH_ATTN_2_AVAILABLE[ \t]*$")
     def repl(m):
         ind = m.group("ind")
@@ -651,7 +618,6 @@ else:
     if s2 != s:
         s = s2; changed = True
 
-    # 2) Вариант с комментарием в конце assert-строки
     pat2 = re.compile(r"(?m)^(?P<ind>[ \t]*)assert[ \t]+FLASH_ATTN_2_AVAILABLE[^\n]*$")
     s2 = pat2.sub(repl, s)
     if s2 != s:
@@ -664,9 +630,7 @@ else:
         print("[patch] attention.py: fallback already fixed or assert not found")
 PY_ATTN_FALLBACK_FIX
 
-# -----------------------------------------------------------------------------
 # attention.py: SAFE SDPA WRAPPER — выровнять dtype/device и ручной fallback
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_ATTN_SAFE'
 from pathlib import Path
 import re
@@ -677,7 +641,6 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # Вставим helper один раз
     if "def _wan_sdpa_safe(" not in s:
         helper = r"""
 
@@ -685,10 +648,8 @@ else:
 def _wan_sdpa_safe(q, k, v, dropout_p=0.0, is_causal=False):
     import torch, torch.nn.functional as F
     dev = q.device
-    # Выравниваем устройство
     if k.device != dev: k = k.to(dev)
     if v.device != dev: v = v.to(dev)
-    # Выравниваем тип: на CUDA -> fp16, иначе fp32
     want = torch.float16 if dev.type == "cuda" else torch.float32
     if q.dtype not in (torch.float16, torch.float32): q = q.to(want)
     if k.dtype not in (torch.float16, torch.float32): k = k.to(want)
@@ -697,18 +658,14 @@ def _wan_sdpa_safe(q, k, v, dropout_p=0.0, is_causal=False):
         q = q.to(torch.float16); k = k.to(torch.float16); v = v.to(torch.float16)
     else:
         q = q.to(torch.float32); k = k.to(torch.float32); v = v.to(torch.float32)
-    # Континуальность
     q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
-    # Dropout в инференсе = 0
     try:
         if not torch.is_grad_enabled(): dropout_p = 0.0
     except Exception:
         dropout_p = 0.0
-    # Основной путь: SDPA
     try:
         return F.scaled_dot_product_attention(q, k, v, None, dropout_p, is_causal)
     except Exception as e:
-        # Ручной бэкап: softmax(QK^T/sqrt(d)) V
         try:
             d = q.shape[-1]
             scale = (1.0 / (d ** 0.5))
@@ -722,18 +679,14 @@ def _wan_sdpa_safe(q, k, v, dropout_p=0.0, is_causal=False):
             raise RuntimeError(f"wan-sdpa failed: {e} ; fallback failed: {e2}")
 # === end inserted ===
 """
-        # Вставим helper перед первой декларацией класса/функции
         idx = s.find("class ")
         if idx == -1:
             idx = s.find("def ")
         if idx != -1:
             s = s[:idx] + helper + s[idx:]
             changed = True
-
-    # Подменим место, где мы ранее ставили SDPA fallback (метка ##__SDPA_FALLBACK__)
     pat = re.compile(r"(?m)^[ \t]*##__SDPA_FALLBACK__\s*\n[ \t]*if not FLASH_ATTN_2_AVAILABLE:[\s\S]*?return[^\n]*$")
     def repl(m):
-        # Сохраняем отступ первой строки блока
         first_line = m.group(0).splitlines()[0]
         ind = first_line[:len(first_line)-len(first_line.lstrip())]
         return (
@@ -753,9 +706,7 @@ def _wan_sdpa_safe(q, k, v, dropout_p=0.0, is_causal=False):
         print("[patch] attention.py: already safe")
 PY_ATTN_SAFE
 
-# -----------------------------------------------------------------------------
 # attention.py: fix NameError(is_causal) — всегда некаузально для WanSelfAttention
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_ATTN_ISCAUSAL_FIX'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/modules/attention.py")
@@ -765,7 +716,6 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) Наш безопасный хелпер мог вызываться с is_causal -> заменим на False
     s2 = re.sub(
         r"_wan_sdpa_safe\s*\(\s*q\s*,\s*k\s*,\s*v\s*,\s*dropout_p\s*,\s*is_causal\s*\)",
         "_wan_sdpa_safe(q, k, v, dropout_p, False)",
@@ -774,7 +724,6 @@ else:
     if s2 != s:
         s = s2; changed = True
 
-    # 2) Прямой SDPA мог вызываться с is_causal -> заменим на False
     s2 = re.sub(
         r"scaled_dot_product_attention\s*\(\s*q\s*,\s*k\s*,\s*v\s*,\s*None\s*,\s*dropout_p\s*,\s*is_causal\s*\)",
         "scaled_dot_product_attention(q, k, v, None, dropout_p, False)",
@@ -790,9 +739,7 @@ else:
         print("[patch] attention.py: nothing to change (already non-causal)")
 PY_ATTN_ISCAUSAL_FIX
 
-# -----------------------------------------------------------------------------
 # attention.py: SDPA merge heads -> (B, T, H*D) to match Linear(3072,3072)
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_ATTN_RETURN_SHAPE'
 from pathlib import Path
 import re
@@ -803,13 +750,11 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) Вставим helper для слияния голов (один раз)
     if "def _wan_sdpa_merge(" not in s:
         helper = r"""
 
 # === inserted: sdpa merge to (B,T,H*D) ===
 def _wan_sdpa_merge(q, k, v, dropout_p=0.0, is_causal=False):
-    # q,k,v ожидаются как (B,H,T,D)
     out = _wan_sdpa_safe(q, k, v, dropout_p, False)  # non-causal
     B, H, T, D = out.shape
     # (B,H,T,D) -> (B,T,H,D) -> (B,T,H*D)
@@ -817,7 +762,6 @@ def _wan_sdpa_merge(q, k, v, dropout_p=0.0, is_causal=False):
     return out
 # === end inserted ===
 """
-        # Вставим helper перед первой декларацией класса/функции
         idx = s.find("class ")
         if idx == -1:
             idx = s.find("def ")
@@ -825,7 +769,6 @@ def _wan_sdpa_merge(q, k, v, dropout_p=0.0, is_causal=False):
             s = s[:idx] + helper + s[idx:]
             changed = True
 
-    # 2) Заменим блок нашего фолбэка, чтобы возвращать слитую форму
     pat = re.compile(
         r"(?ms)^([ \t]*)##__SDPA_FALLBACK__\s*\n\1if not FLASH_ATTN_2_AVAILABLE:\s*\n.*?return[^\n]*$"
     )
@@ -848,9 +791,7 @@ def _wan_sdpa_merge(q, k, v, dropout_p=0.0, is_causal=False):
         print("[patch] attention.py: return-shape already correct or markers not found")
 PY_ATTN_RETURN_SHAPE
 
-# -----------------------------------------------------------------------------
 # attention.py: robust SDPA merge (поддержка 3D и 4D выходов)
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_ATTN_RETURN_SHAPE_V2'
 from pathlib import Path
 import re
@@ -861,19 +802,16 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # Переписываем тело _wan_sdpa_merge на робастное (3D/4D)
     pat = re.compile(
         r"(?ms)^def\s+_wan_sdpa_merge\s*\(\s*q\s*,\s*k\s*,\s*v\s*,\s*dropout_p\s*=\s*0\.0\s*,\s*is_causal\s*=\s*False\s*\)\s*:\s*.*?# === end inserted ==="
     )
     new_body = r"""def _wan_sdpa_merge(q, k, v, dropout_p=0.0, is_causal=False):
-    # Стремимся вернуть (B,T,C). Если SDPA дал (B,H,T,D) — сливаем головы.
     out = _wan_sdpa_safe(q, k, v, dropout_p, False)  # non-causal
     if out.dim() == 4:
         B, H, T, D = out.shape
         out = out.transpose(1, 2).contiguous().view(B, T, H * D)
         return out
     elif out.dim() == 3:
-        # Уже (B,T,C): отдаём как есть
         return out
     else:
         raise RuntimeError(f"unexpected SDPA output rank: {out.dim()} with shape {tuple(out.shape)}")
@@ -883,12 +821,10 @@ else:
         s = s2
         changed = True
     else:
-        # если сигнатура отличается — просто вставим/заменим определение функции
         if "def _wan_sdpa_merge(" in s:
             s = re.sub(r"(?ms)^def\s+_wan_sdpa_merge\(.*?\)\s*:\s*.*?$", new_body, s)
             changed = True
         else:
-            # не нашли — вставим helper перед первой декларацией класса/функции
             idx = s.find("class ")
             if idx == -1:
                 idx = s.find("def ")
@@ -903,9 +839,7 @@ else:
         print("[patch] attention.py: merge already robust")
 PY_ATTN_RETURN_SHAPE_V2
 
-# -----------------------------------------------------------------------------
 # attention.py: WAN_FORCE_EAGER_ATTN=1 → всегда ручной путь (без SDPA/Flash)
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_ATTN_EAGER'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/modules/attention.py")
@@ -930,9 +864,7 @@ else:
         print("[patch] attention.py: switch already present or safe wrapper missing")
 PY_ATTN_EAGER
 
-# -----------------------------------------------------------------------------
 # model.py: guard перед self.o(x) — слияние голов до in_features (например 3072)
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_ATTN_O_GUARD'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/modules/model.py")
@@ -940,7 +872,7 @@ if not p.exists():
     print("[patch][warn] model.py not found for attn-o guard")
 else:
     s = p.read_text(encoding="utf-8")
-    # Ищем строку "x = self.o(x)" в WanSelfAttention.forward (лог указывает на ~строку 183)
+    # Ищем строку "x = self.o(x)" в WanSelfAttention.forward
     pat = re.compile(r"(?m)^(\s*)x\s*=\s*self\.o\(x\)\s*$")
     def repl(m):
         ind = m.group(1)
@@ -967,9 +899,7 @@ f"""{ind}# __ATTN_O_GUARD__: если last-dim < in_features и кратен —
         print("[patch] model.py: pattern 'x = self.o(x)' not found (maybe already patched?)")
 PY_ATTN_O_GUARD
 
-# -----------------------------------------------------------------------------
 # model.py: SKIP cross-attn по env WAN_FORCE_NO_TEXT=1 или пустому промпту
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_SKIP_XATTN'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/modules/model.py")
@@ -986,7 +916,7 @@ f"""{ind}# __SKIP_XATTN__: по флагу окольцовываем без cro
 {ind}import os as _os
 {ind}_skip = _os.environ.get("WAN_FORCE_NO_TEXT","0") == "1"
 {ind}if (context is None) or _skip:
-{ind}    x = x  # пропускаем cross-attn
+{ind}    x = x 
 {ind}else:
 {ind}    x = x + self.cross_attn(self.norm3(x), context, context_lens)"""
         )
@@ -998,9 +928,7 @@ f"""{ind}# __SKIP_XATTN__: по флагу окольцовываем без cro
         print("[patch] model.py: pattern for SKIP_XATTN not found (maybe already patched?)")
 PY_SKIP_XATTN
 
-# -----------------------------------------------------------------------------
 # model.py: CROSS-BATCH ALIGN в WanCrossAttention.forward (Q vs K/V)
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_CROSS_BATCH_ALIGN'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/modules/model.py")
@@ -1008,7 +936,6 @@ if not p.exists():
     print("[patch][warn] model.py not found for cross-batch align")
 else:
     s = p.read_text(encoding="utf-8")
-    # Вариант А: заменяем сам вызов flash_attention(...)
     patA = re.compile(r"(?m)^(\s*)x\s*=\s*flash_attention\(\s*q\s*,\s*k\s*,\s*v\s*,\s*k_lens\s*=\s*context_lens\s*\)\s*$")
     def replA(m):
         ind = m.group(1)
@@ -1029,12 +956,10 @@ f"""{ind}# __CROSS_BATCH_ALIGN__: выровнять batch-ось Q vs K/V
     s2, nA = patA.subn(replA, s, count=1)
     if nA == 0:
         # Вариант B: вставка перед flash_attention(...) внутри WanCrossAttention.forward
-        # Найдём функцию forward класса WanCrossAttention
         patHead = re.compile(r"(?ms)^class\s+WanCrossAttention\b.*?^\s*def\s+forward\s*\(\s*self\s*,\s*x\s*,\s*context\s*,\s*context_lens\s*\)\s*:\s*\n")
         mHead = patHead.search(s)
         if mHead:
             insert_pos = mHead.end()
-            # Вставим блок выравнивания прямо перед первым вызовом flash_attention
             patCall = re.compile(r"(?m)^(\s*)x\s*=\s*flash_attention\(")
             mCall = patCall.search(s, pos=insert_pos)
             if mCall:
@@ -1065,10 +990,7 @@ f"""{ind}# __CROSS_BATCH_ALIGN__: выровнять batch-ось Q vs K/V (in-f
     else:
         print("[patch] model.py: could not install cross-batch align (pattern mismatch?)")
 PY_CROSS_BATCH_ALIGN
-
-# -----------------------------------------------------------------------------
 # image2video.py: принудительно выровнять каналы sample к 4 * frame_num
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_LATENT_CHAN_SYNC'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/image2video.py")
@@ -1078,10 +1000,9 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) Вставим helper один раз
     if "_ensure_latent_channels(" not in s:
         helper = r"""
-# --- inserted: ensure latent channels match 4*frame_num ---
+#inserted: ensure latent channels match 4*frame_num
 def _ensure_latent_channels(sample, frame_num:int):
     import torch
     want = int(frame_num) * 4
@@ -1097,20 +1018,16 @@ def _ensure_latent_channels(sample, frame_num:int):
     tail = sample.shape[2:]
     if have > want:
         return sample[:, :want, ...]
-    # pad
     pad = torch.randn((B, want - have, *tail), device=sample.device, dtype=sample.dtype)
     return torch.cat([sample, pad], dim=1)
 # --- end inserted ---
 """
-        # Вставим перед первой декларацией класса/функции
         idx = s.find("class ")
         if idx == -1:
             idx = s.find("def ")
         if idx != -1:
             s = s[:idx] + helper + s[idx:]
             changed = True
-
-    # 2) Перед самым первым вызовом scheduler.step(...) гарантируем выравнивание
     # Ищем первую строку "temp_x0 = sample_scheduler.step("
     pat = re.compile(r"(?m)^(\s*)temp_x0\s*=\s*sample_scheduler\.step\(")
     m = pat.search(s)
@@ -1133,9 +1050,7 @@ def _ensure_latent_channels(sample, frame_num:int):
         print("[patch] image2video.py: latent chan sync already present or pattern not found")
 PY_LATENT_CHAN_SYNC
 
-# -----------------------------------------------------------------------------
-# fm_solvers_unipc.py: выровнять каналы sample к model_output в convert_model_output (фикс отступов)
-# -----------------------------------------------------------------------------
+# fm_solvers_unipc.py: выровнять каналы sample к model_output в convert_model_output
 ${PYBIN} - <<'PY_SCHED_CHAN_GUARD_FIX'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/utils/fm_solvers_unipc.py")
@@ -1144,8 +1059,6 @@ if not p.exists():
 else:
     s = p.read_text(encoding="utf-8")
     changed = False
-
-    # 1) Гарантируем helper на уровне модуля (в КОНЦЕ файла) — без шансов попасть внутрь функции/класса
     if "_align_channels_like(" not in s:
         helper = (
             "\n\n"
@@ -1169,7 +1082,6 @@ else:
         s = s.rstrip() + helper
         changed = True
 
-    # 2) Патчим первую строку с x0_pred = sample - sigma_t * model_output
     pat = re.compile(r"(?m)^(?P<ind>[ \t]*)x0_pred\s*=\s*sample\s*-\s*sigma_t\s*\*\s*model_output\s*$")
     def repl(m):
         ind = m.group("ind")
@@ -1191,9 +1103,7 @@ else:
 PY_SCHED_CHAN_GUARD_FIX
 
 
-# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
-# -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/image2video.py")
@@ -1228,9 +1138,6 @@ else:
     else:
         print("[fix] nothing to change (already OK or not found)")
 PY_REINDENT
-
-# -----------------------------------------------------------------------------
 # Запуск хэндлера
-# -----------------------------------------------------------------------------
 echo "[start] Launching handler..."
 exec ${PYBIN} -u /app/handler.py
