@@ -930,6 +930,42 @@ else:
         print("[patch] attention.py: switch already present or safe wrapper missing")
 PY_ATTN_EAGER
 
+# -----------------------------------------------------------------------------
+# model.py: guard перед self.o(x) — слияние голов до in_features (например 3072)
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_ATTN_O_GUARD'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/modules/model.py")
+if not p.exists():
+    print("[patch][warn] model.py not found for attn-o guard")
+else:
+    s = p.read_text(encoding="utf-8")
+    # Ищем строку "x = self.o(x)" в WanSelfAttention.forward (лог указывает на ~строку 183)
+    pat = re.compile(r"(?m)^(\s*)x\s*=\s*self\.o\(x\)\s*$")
+    def repl(m):
+        ind = m.group(1)
+        return (
+f"""{ind}# __ATTN_O_GUARD__: если last-dim < in_features и кратен — восстановим H и сольём головы
+{ind}_x_in = x
+{ind}try:
+{ind}    _exp = getattr(self.o, 'in_features', None)
+{ind}    _d   = int(_x_in.shape[-1])
+{ind}    if _exp and _d != _exp and (_exp % _d) == 0:
+{ind}        _H   = _exp // _d
+{ind}        _n0  = _x_in.numel() // _d
+{ind}        if (_n0 % _H) == 0:
+{ind}            _x_in = _x_in.reshape(_n0//_H, _H, _d).reshape(_n0//_H, _exp)
+{ind}    x = self.o(_x_in)
+{ind}except Exception:
+{ind}    x = self.o(x)"""
+        )
+    s2, n = pat.subn(repl, s, count=1)
+    if n > 0:
+        p.write_text(s2, encoding="utf-8")
+        print("[patch] model.py: self.o() input guard installed")
+    else:
+        print("[patch] model.py: pattern 'x = self.o(x)' not found (maybe already patched?)")
+PY_ATTN_O_GUARD
 
 # -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
