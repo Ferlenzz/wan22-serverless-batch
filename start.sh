@@ -624,56 +624,45 @@ def _ensure_frame_channels(self, u):
 PY_CHAN_GUARD
 
 # -----------------------------------------------------------------------------
-# attention.py: Fallback на Torch SDPA, если FLASH_ATTN_2_AVAILABLE = False
-#  - убираем жесткий assert и возвращаем SDPA-результат
-#  - формы (B, H, T, D) поддерживаются самим F.scaled_dot_product_attention
+# attention.py: SDPA fallback (фикс отступа внутри ветки else)
+#   - заменяем 'assert FLASH_ATTN_2_AVAILABLE' на корректно ИНДЕНТИРОВАННЫЙ fallback
 # -----------------------------------------------------------------------------
-${PYBIN} - <<'PY_ATTN_FALLBACK'
-from pathlib import Path
-import re
-
+${PYBIN} - <<'PY_ATTN_FALLBACK_FIX'
+from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/modules/attention.py")
 if not p.exists():
-    print("[patch][warn] attention.py not found for SDPA fallback")
+    print("[patch][warn] attention.py not found for SDPA fallback fix")
 else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) Мягко заменим строку с assert FLASH_ATTN_2_AVAILABLE на условный fallback
-    #    Ищем одиночный assert без лишних условий
-    pat = re.compile(r"^[ \t]*assert[ \t]+FLASH_ATTN_2_AVAILABLE[ \t]*$", re.M)
-    if pat.search(s) and "##__SDPA_FALLBACK__" not in s:
-        s = pat.sub(
-            "##__SDPA_FALLBACK__\n"
-            "if not FLASH_ATTN_2_AVAILABLE:\n"
-            "    import torch.nn.functional as F\n"
-            "    # F.scaled_dot_product_attention принимает (B,H,T,D) напрямую\n"
-            "    # Предполагаем, что q,k,v уже приведены к (B,H,T,D)\n"
-            "    return F.scaled_dot_product_attention(q, k, v, None, dropout_p, is_causal)",
-            s,
-            count=1
+    # 1) Вариант без комментария
+    pat = re.compile(r"(?m)^(?P<ind>[ \t]*)assert[ \t]+FLASH_ATTN_2_AVAILABLE[ \t]*$")
+    def repl(m):
+        ind = m.group("ind")
+        return (
+            f"{ind}##__SDPA_FALLBACK__\n"
+            f"{ind}if not FLASH_ATTN_2_AVAILABLE:\n"
+            f"{ind}    import torch.nn.functional as F\n"
+            f"{ind}    # F.scaled_dot_product_attention(q,k,v,attn_mask,dropout,is_causal)\n"
+            f"{ind}    return F.scaled_dot_product_attention(q, k, v, None, dropout_p, is_causal)"
         )
-        changed = True
+    s2 = pat.sub(repl, s)
+    if s2 != s:
+        s = s2; changed = True
 
-    # 2) На случай другой записи assert'а с комментарием на конце строки
-    pat2 = re.compile(r"^[ \t]*assert[ \t]+FLASH_ATTN_2_AVAILABLE[^\n]*$", re.M)
-    if not changed and pat2.search(s) and "##__SDPA_FALLBACK__" not in s:
-        s = pat2.sub(
-            "##__SDPA_FALLBACK__\n"
-            "if not FLASH_ATTN_2_AVAILABLE:\n"
-            "    import torch.nn.functional as F\n"
-            "    return F.scaled_dot_product_attention(q, k, v, None, dropout_p, is_causal)",
-            s,
-            count=1
-        )
-        changed = True
+    # 2) Вариант с комментарием в конце assert-строки
+    pat2 = re.compile(r"(?m)^(?P<ind>[ \t]*)assert[ \t]+FLASH_ATTN_2_AVAILABLE[^\n]*$")
+    s2 = pat2.sub(repl, s)
+    if s2 != s:
+        s = s2; changed = True
 
     if changed:
         p.write_text(s, encoding="utf-8")
-        print("[patch] attention.py: SDPA fallback installed")
+        print("[patch] attention.py: SDPA fallback re-indented")
     else:
-        print("[patch] attention.py: fallback already present or assert pattern not found")
-PY_ATTN_FALLBACK
+        print("[patch] attention.py: fallback already fixed or assert not found")
+PY_ATTN_FALLBACK_FIX
 
 # -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
