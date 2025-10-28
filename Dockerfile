@@ -1,7 +1,5 @@
-# ---------- BASE ----------
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-# ---------- SYSTEM ----------
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
@@ -14,32 +12,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python3 -m pip install --upgrade pip setuptools wheel packaging
 
-# ---------- TORCH (cu121) ----------
+# TORCH (cu121)
 RUN pip install --index-url https://download.pytorch.org/whl/cu121 \
     torch==2.4.0 torchvision==0.19.0
 
 # XFormers wheel (no-compile) for cu121
 RUN pip install xformers==0.0.27.post2 -f https://download.pytorch.org/whl/cu121
 
-# ---------- WAN 2.2 code ----------
+# WAN 2.2 code
 WORKDIR /app
 ARG WAN_REF=main
 RUN git clone https://github.com/Wan-Video/Wan2.2.git /app/Wan2.2 && \
     cd /app/Wan2.2 && git fetch --all --tags && git checkout ${WAN_REF}
 
-# убираем flash-attn/xformers из requirements (чтобы не компилились)
+# убираем flash-attn/xformers
 WORKDIR /app/Wan2.2
 RUN awk 'BEGIN{IGNORECASE=1} !/flash[-_]?attn/ && !/xformers/ {print}' requirements.txt > /tmp/req-pruned.txt && \
     pip install --no-cache-dir --prefer-binary -r /tmp/req-pruned.txt
 
-# ---------- Base runtime deps ----------
 RUN pip install --no-cache-dir --prefer-binary \
       runpod==1.6.2 loguru==0.7.2 pillow==10.4.0 \
       imageio==2.36.0 imageio-ffmpeg==0.5.1 numpy==1.26.4 \
       decord==0.6.0 opencv-python-headless==4.10.0.84 \
       safetensors==0.4.5 einops==0.7.0 huggingface_hub==0.20.3
 
-# ---------- Diffusers / Transformers / PEFT ----------
+# Diffusers / Transformers / PEFT
 RUN pip install --no-cache-dir --prefer-binary \
       diffusers>=0.33.0 transformers==4.44.2 accelerate==0.34.2 \
       peft==0.17.1
@@ -54,7 +51,7 @@ assert v.startswith("0.31."), f"diffusers version must be 0.31.x, got {v}"
 print("[check] diffusers", v)
 PY
 
-# ---------- AUDIO STACK (librosa и зависимости) ----------
+#AUDIO STACK (librosa и зависимости)
 RUN pip install --no-cache-dir --prefer-binary \
       scipy==1.11.4 \
       numba==0.60.0 llvmlite==0.43.0 \
@@ -62,7 +59,7 @@ RUN pip install --no-cache-dir --prefer-binary \
       pooch==1.8.2 soundfile==0.12.1 audioread==3.0.1 \
       librosa==0.10.2.post1
 
-# ---------- ПАТЧ №1: фильтрованная загрузка VAE из .pth (fallback) ----------
+#ПАТЧ №1: фильтрованная загрузка VAE из .pth (fallback)
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
@@ -86,7 +83,6 @@ def _load_filtered_state_dict(model, ckpt):
 if "def _load_filtered_state_dict" not in s:
     s = s.replace("import torch", "import torch\n" + helper, 1)
 
-# покрываем варианты с/без assign=
 s = re.sub(
     r"model\.load_state_dict\(\s*torch\.load\(([^)]+)\)\s*,\s*assign=True\s*\)",
     r"missing, mism = _load_filtered_state_dict(model, torch.load(\1))",
@@ -101,7 +97,7 @@ p.write_text(s, encoding="utf-8")
 print("patched (filtered load)", p)
 PY
 
-# ---------- ПАТЧ №2: diffusers VAE backend (WAN/BASE) + CPU-load + materialize + fix nn.Module.__init__ ----------
+#ПАТЧ №2: diffusers VAE backend (WAN/BASE) + CPU-load + materialize + fix nn.Module.__init__
 ARG PATCH_REV=4
 RUN echo "patch rev ${PATCH_REV}" && python3 - <<'PY'
 from pathlib import Path
@@ -109,13 +105,12 @@ p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
 s = p.read_text(encoding="utf-8")
 
 append = r'''
-# ---- Diffusers VAE backend (WAN if available, else BASE). CPU-load fallback when no to_empty + CPU materialization ----
+# Diffusers VAE backend (WAN if available, else BASE). CPU-load fallback when no to_empty + CPU materialization
 import os as _os, inspect as _inspect
 import torch as _torch
 from huggingface_hub import hf_hub_download
 import json as _json
 
-# 1) выбираем класс
 try:
     from diffusers import AutoencoderKLWan as _DiffVAE
     _WAN = True
@@ -129,7 +124,6 @@ def _filter_kwargs_for_ctor(cfg: dict, cls):
     return {k: v for k, v in cfg.items() if k in allowed}
 
 def _materialize_on_cpu(module):
-    # Материализуем meta-параметры/буферы на CPU, чтобы .to(...) не падал.
     import torch.nn as _nn
     for name, p in list(module.named_parameters(recurse=True)):
         if getattr(p, "is_meta", False):
@@ -165,7 +159,6 @@ def _vae_build_diffusers(_device):
     vae = _DiffVAE.from_config(cfg)  # CPU by default
     dtype = _torch.float16 if _device.type == "cuda" else _torch.float32
 
-    # 4) режим выделения параметров:
     used_to_empty = False
     if hasattr(vae, "to_empty"):
         try:
@@ -178,14 +171,12 @@ def _vae_build_diffusers(_device):
             except Exception:
                 used_to_empty = False
 
-    # 5) грузим state_dict с фильтром по форме
     try:
         from safetensors.torch import load_file as _load_sf
         sd_full = _load_sf(w_path, device="cpu")
     except Exception:
         sd_full = _torch.load(w_path, map_location="cpu")
 
-    # В CPU-ветке материализуем параметры на CPU до загрузки, чтобы не остались meta
     if not used_to_empty:
         _materialize_on_cpu(vae)
 
@@ -199,7 +190,6 @@ def _vae_build_diffusers(_device):
     except TypeError:
         vae.load_state_dict(sd, strict=False)
 
-    # 6) перенос после загрузки
     if not used_to_empty:
         vae = vae.to(_device, dtype=dtype)
     else:
@@ -222,7 +212,6 @@ if _os.environ.get("USE_DIFFUSERS_VAE", "0") == "1":
             continue
         def _init(self, *a, **kw):
             import torch.nn as _nn
-            # критично: обязательно инициализируем базовый nn.Module
             try:
                 _nn.Module.__init__(self)
             except Exception:
@@ -240,16 +229,15 @@ p.write_text(s, encoding="utf-8")
 print("patched (diffusers WAN/BASE backend with cpu-load + materialize + nn.Module.__init__ fix)", p)
 PY
 
-# ---------- APP ----------
+#APP
 WORKDIR /app
 COPY engine.py /app/engine.py
 COPY handler.py /app/handler.py
 
-# ---------- стартовый скрипт ----------
 COPY start.sh /app/start.sh
 RUN chmod 755 /app/start.sh && sed -i 's/\r$//' /app/start.sh
 
-# ---------- ENV ----------
+# ENV
 ENV RP_VOLUME=/runpod-volume
 ENV WAN_ROOT=/app/Wan2.2
 ENV PYTHONPATH=/app/Wan2.2:$PYTHONPATH
@@ -264,9 +252,8 @@ ENV MPLCONFIGDIR=/tmp/matplotlib
 # включаем diffusers-бэкенд VAE
 ENV USE_DIFFUSERS_VAE=1
 
-# отключаем «быструю» загрузку HF (чтобы не требовался hf_transfer)
+# загрузка HF (чтобы не требовался hf_transfer)
 ENV HF_ENABLE_HF_TRANSFER=
 ENV HF_HUB_ENABLE_HF_TRANSFER=
 
-# ---------- ENTRY ----------
 CMD ["/app/start.sh"]
