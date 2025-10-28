@@ -754,6 +754,43 @@ def _wan_sdpa_safe(q, k, v, dropout_p=0.0, is_causal=False):
 PY_ATTN_SAFE
 
 # -----------------------------------------------------------------------------
+# attention.py: fix NameError(is_causal) — всегда некаузально для WanSelfAttention
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_ATTN_ISCAUSAL_FIX'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/modules/attention.py")
+if not p.exists():
+    print("[patch][warn] attention.py not found for is_causal fix")
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # 1) Наш безопасный хелпер мог вызываться с is_causal -> заменим на False
+    s2 = re.sub(
+        r"_wan_sdpa_safe\s*\(\s*q\s*,\s*k\s*,\s*v\s*,\s*dropout_p\s*,\s*is_causal\s*\)",
+        "_wan_sdpa_safe(q, k, v, dropout_p, False)",
+        s
+    )
+    if s2 != s:
+        s = s2; changed = True
+
+    # 2) Прямой SDPA мог вызываться с is_causal -> заменим на False
+    s2 = re.sub(
+        r"scaled_dot_product_attention\s*\(\s*q\s*,\s*k\s*,\s*v\s*,\s*None\s*,\s*dropout_p\s*,\s*is_causal\s*\)",
+        "scaled_dot_product_attention(q, k, v, None, dropout_p, False)",
+        s
+    )
+    if s2 != s:
+        s = s2; changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] attention.py: is_causal -> False (non-causal SDPA)")
+    else:
+        print("[patch] attention.py: nothing to change (already non-causal)")
+PY_ATTN_ISCAUSAL_FIX
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
