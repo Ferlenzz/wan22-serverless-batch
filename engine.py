@@ -220,7 +220,23 @@ def _invoke_wan(obj, **kw):
         kwargs.setdefault("prompt", prompt_val)
         kwargs.setdefault("input_prompt", prompt_val)
 
-    return fn(*args, **kwargs)
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        import traceback as _tb
+        print("[wan-debug] generation exception:", repr(e))
+        try:
+            # Log key runtime knobs for quick triage
+            _img = kwargs.get('img') or kwargs.get('image')
+            _size = getattr(_img, 'size', None)
+            _frame_num = kwargs.get('frame_num') or kwargs.get('length') or kwargs.get('frames')
+            _fps = kwargs.get('fps'); _steps = kwargs.get('steps') or kwargs.get('num_inference_steps')
+            print('[wan-debug] key args:', 'img_size', _size, 'frame_num', _frame_num, 'fps', _fps, 'steps', _steps)
+        except Exception:
+            pass
+        _tb.print_exc()
+        raise
+
 
 class _WanI2VProxy:
     def __init__(self, obj): self._obj = obj
