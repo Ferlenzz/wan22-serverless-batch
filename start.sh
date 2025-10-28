@@ -558,6 +558,72 @@ else:
 PY_MASK_FIX
 
 # -----------------------------------------------------------------------------
+# model.py: CHANNEL GUARD — привести каналы к 4*frame_num (напр. 48 при 12 кадрах)
+# до patch_embedding, чтобы Conv3d(48, …) не падал на 68 каналах
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_CHAN_GUARD'
+from pathlib import Path
+import re
+
+p = Path("/app/Wan2.2/wan/modules/model.py")
+if not p.exists():
+    print("[patch][warn] model.py not found for channel-guard")
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # 1) Вставим helper (один раз, идемпотентно)
+    if "_ensure_frame_channels(" not in s:
+        helper = r"""
+
+# --- inserted: ensure frame channels match 4*frame_num ---
+def _ensure_frame_channels(self, u):
+    # u: Tensor [C, H, W] (стек каналов латента)
+    import torch
+    C = int(u.shape[0])
+    want = None
+    for src in (getattr(self, "frame_num", None),
+                getattr(getattr(self, "config", None), "frame_num", None),
+                getattr(getattr(self, "config", None), "T", None)):
+        try:
+            if src is not None:
+                want = int(src)
+                break
+        except Exception:
+            pass
+    if not want or want <= 0:
+        want = 12
+    targetC = 4 * want
+    if C == targetC:
+        return u
+    if C > targetC:
+        print(f"[chan] trim channels: {C} -> {targetC}")
+        return u[:targetC, ...]
+    # C < targetC: дополним последним каналом
+    rep = targetC - C
+    return torch.cat([u, u[-1:, ...].repeat(rep, 1, 1)], dim=0)
+# --- end inserted ---
+"""
+        idx = s.find("class ")
+        if idx != -1:
+            s = s[:idx] + helper + s[idx:]
+            changed = True
+
+    # 2) Перед patch_embedding пропустим через гард
+    # x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+    pat = re.compile(r"x\s*=\s*\[self\.patch_embedding\(\s*u\.unsqueeze\(0\)\s*\)\s*for\s+u\s+in\s+x\s*\]")
+    if pat.search(s) and "_ensure_frame_channels(self, u).unsqueeze(0)" not in s:
+        s = pat.sub("x = [self.patch_embedding(_ensure_frame_channels(self, u).unsqueeze(0)) for u in x]", s)
+        changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] model.py: channel guard installed")
+    else:
+        print("[patch] model.py: channel guard already present or pattern not found")
+PY_CHAN_GUARD
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
