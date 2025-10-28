@@ -16,10 +16,18 @@ export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 #  - WAN_FORCE_BOUNDARY_OFF=1 мягко отключает boundary в рантайме
 #  - WAN_FORCE_FRAMES=N: жёстко выставляет кадры в объекте/конфиге + пробрасывает kw
 # -----------------------------------------------------------------------------
+
 ${PYBIN} - <<'PY_SITE'
 from pathlib import Path
 code = r'''
-import builtins, inspect, os
+import builtins, inspect, os, functools
+
+def _unwrap_until(fn, marker):
+    seen = set()
+    while getattr(fn, marker, False) and fn not in seen:
+        seen.add(fn)
+        fn = getattr(fn, "__wrapped__", getattr(fn, "_orig", fn))
+    return fn
 
 def _force_frames(self, n:int):
     for name in ('frame_num','num_frames','frames','length','video_frames','T'):
@@ -38,6 +46,7 @@ def _patch_wani2v(mod):
         if cls is None:
             return
 
+        # callable()
         if not hasattr(cls, "__call__"):
             def __call__(self, *a, **k):
                 for name in ("generate","infer","forward","run","predict","sample"):
@@ -47,9 +56,11 @@ def _patch_wani2v(mod):
                 raise TypeError("WanI2V is not callable and no known generate-like method was found")
             cls.__call__ = __call__
 
+        # shim для именованных аргументов
         gen = getattr(cls, "generate", None)
         if callable(gen) and not getattr(gen, "_shimmed_kwmap", False):
             sig = inspect.signature(gen); params = sig.parameters
+            @functools.wraps(gen)
             def _shim(self, *args, **kwargs):
                 if not args:
                     prompt = kwargs.pop('prompt', kwargs.pop('input_prompt', ''))
@@ -66,17 +77,23 @@ def _patch_wani2v(mod):
             _shim._shimmed_kwmap = True
             cls.generate = _shim
 
+        # boundary OFF
         if os.environ.get("WAN_FORCE_BOUNDARY_OFF","0") == "1" and not getattr(cls, "_force_boundary_off", False):
-            _orig = cls.generate
+            base = _unwrap_until(cls.generate, "_boundary_wrapped")
+            @functools.wraps(base)
             def _wrap_boundary(self, *a, **k):
                 try: self.boundary = 0
                 except Exception: pass
-                return _orig(self, *a, **k)
+                return base(self, *a, **k)
+            _wrap_boundary._boundary_wrapped = True
+            _wrap_boundary._orig = base
             cls.generate = _wrap_boundary
             cls._force_boundary_off = True
 
+        # FRAMES hook
         if not getattr(cls, "_force_frames_hook", False):
-            _orig = cls.generate
+            base0 = _unwrap_until(cls.generate, "_frames_wrapped")
+            @functools.wraps(base0)
             def _wrap_frames(self, *a, **k):
                 n = os.environ.get("WAN_FORCE_FRAMES")
                 if n:
@@ -90,7 +107,7 @@ def _patch_wani2v(mod):
                             except Exception: pass
                 if n:
                     _force_frames(self, n)
-                    sig = inspect.signature(_orig)
+                    sig = inspect.signature(base0)
                     for key in ("frame_num","num_frames","frames","length"):
                         if key in sig.parameters:
                             k[key] = n; break
@@ -100,7 +117,9 @@ def _patch_wani2v(mod):
                             if fps > 0: k["seconds"] = max(n / fps, 1.0 / fps)
                         except Exception:
                             pass
-                return _orig(self, *a, **k)
+                return base0(self, *a, **k)
+            _wrap_frames._frames_wrapped = True
+            _wrap_frames._orig = base0
             cls.generate = _wrap_frames
             cls._force_frames_hook = True
 
@@ -123,8 +142,9 @@ def _hook(name, globals=None, locals=None, fromlist=(), level=0):
 builtins.__import__ = _hook
 '''
 Path("/app/sitecustomize.py").write_text(code, encoding="utf-8")
-print("[start] wrote sitecustomize.py (callable, shim, boundary OFF, hard frames)")
+print("[start] wrote sitecustomize.py (safe wraps: shim + boundary OFF + frames)")
 PY_SITE
+
 
 # -----------------------------------------------------------------------------
 # Диагностика
