@@ -381,36 +381,38 @@ PY_BOUNDARY
 ${PYBIN} - <<'PY_REINDENT'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/image2video.py")
-if p.exists():
-    s = p.read_text(encoding="utf-8")
-    lines = s.splitlines()
+if not p.exists():
+    print("[fix][warn] image2video.py not found for reindent")
+else:
+    lines = p.read_text(encoding="utf-8").splitlines()
 
-    def leading_spaces(t):
-        return len(t) - len(t.lstrip(' '))
+    def ws_of(s: str):
+        return s[:len(s)-len(s.lstrip())]
+
+    def indent_unit(sample_ws: str):
+        # если предыдущая строка отступлена табами — используем таб, иначе 4 пробела
+        return '\t' if (sample_ws and sample_ws[0] == '\t') else ' ' * 4
 
     changed = False
     for i, line in enumerate(lines):
         if line.strip() == "boundary = _norm_boundary(self)":
-            # ищем ближайшую предшествующую непустую строку
+            # найдём ближайшую непустую предыдущую строку
             j = i - 1
             while j >= 0 and lines[j].strip() == "":
                 j -= 1
-            if j >= 0:
-                prev = lines[j]
-                if prev.strip().startswith("with ") and prev.rstrip().endswith(":"):
-                    want_indent = leading_spaces(prev) + 4
-                    have_indent = leading_spaces(line)
-                    if have_indent != want_indent:
-                        lines[i] = " " * want_indent + "boundary = _norm_boundary(self)"
-                        changed = True
+            if j >= 0 and lines[j].rstrip().endswith(':'):
+                base_ws = ws_of(lines[j])
+                want_ws = base_ws + indent_unit(base_ws)
+                have_ws = ws_of(line)
+                if have_ws != want_ws:
+                    lines[i] = f"{want_ws}boundary = _norm_boundary(self)"
+                    changed = True
 
     if changed:
-        p.write_text("\n".join(lines) + ("\n" if s.endswith("\n") else ""), encoding="utf-8")
-        print("[fix] re-indented 'boundary = _norm_boundary(self)' under its 'with' block")
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print("[fix] boundary line re-indented under its enclosing ':' block")
     else:
-        print("[fix] nothing to change (already well-indented or pattern not found)")
-else:
-    print("[fix][warn] image2video.py not found for reindent")
+        print("[fix] nothing to change (already OK or not found)")
 PY_REINDENT
 
 # -----------------------------------------------------------------------------
