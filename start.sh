@@ -904,6 +904,34 @@ else:
 PY_ATTN_RETURN_SHAPE_V2
 
 # -----------------------------------------------------------------------------
+# attention.py: WAN_FORCE_EAGER_ATTN=1 → всегда ручной путь (без SDPA/Flash)
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_ATTN_EAGER'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/modules/attention.py")
+if not p.exists():
+    print("[patch][warn] attention.py not found for eager-attn switch")
+else:
+    s = p.read_text(encoding="utf-8")
+    if "def _wan_sdpa_safe(" in s and "WAN_FORCE_EAGER_ATTN" not in s:
+        s = s.replace(
+            "def _wan_sdpa_safe(q, k, v, dropout_p=0.0, is_causal=False):",
+            "def _wan_sdpa_safe(q, k, v, dropout_p=0.0, is_causal=False):\n    import os as _os"
+        ).replace(
+            "    # Основной путь: SDPA",
+            "    # Принудительный обход SDPA\n"
+            "    if _os.environ.get('WAN_FORCE_EAGER_ATTN','0') == '1':\n"
+            "        pass  # сразу пойдём в ручной бэкап ниже\n\n"
+            "    # Основной путь: SDPA"
+        )
+        Path(p).write_text(s, encoding="utf-8")
+        print("[patch] attention.py: eager-attn switch added")
+    else:
+        print("[patch] attention.py: switch already present or safe wrapper missing")
+PY_ATTN_EAGER
+
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
