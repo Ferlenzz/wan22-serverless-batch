@@ -387,6 +387,38 @@ def _cmp_ge_boundary(t_val, boundary):
         print("[patch] image2video.py: boundary globals already applied")
 PYPATCH_BOUNDARY_GLOBAL
 
+${PYBIN} - <<'PY'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/image2video.py")
+s = p.read_text(encoding="utf-8")
+
+pat = re.compile(r'^(?P<ind>\s*)boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$', re.M)
+def repl(m):
+    ind  = m.group('ind')
+    ind1 = ind + "    "
+    return (
+        f"{ind}_b = getattr(self,'boundary',None)\n"
+        f"{ind}_n = int(getattr(self,'num_train_timesteps',1000))\n"
+        f"{ind}if isinstance(_b, dict) or hasattr(_b,'get'):\n"
+        f"{ind1}boundary = None if not _b.get('enabled',False) else (\n"
+        f"{ind1}    int(max(0,min(1,float(_b.get('lower',0.0))))*_n),\n"
+        f"{ind1}    int(max(0,min(1,float(_b.get('upper',1.0))))*_n)\n"
+        f"{ind1})\n"
+        f"{ind}else:\n"
+        f"{ind1}try:\n"
+        f"{ind1}    boundary = int(float(_b)*_n)\n"
+        f"{ind1}except Exception:\n"
+        f"{ind1}    boundary = None"
+    )
+
+s2 = pat.sub(repl, s)
+if s2 != s:
+    p.write_text(s2, encoding="utf-8")
+    print("[patch] fixed boundary multiply -> normalized")
+else:
+    print("[patch] target multiply not found (maybe already patched)")
+PY
+
 # -----------------------------------------------------------------------------
 # Запуск хэндлера
 # -----------------------------------------------------------------------------
