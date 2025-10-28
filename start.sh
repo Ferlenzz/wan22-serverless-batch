@@ -13,14 +13,24 @@ export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 # sitecustomize.py (тихий):
 #  - делает WanI2V вызываемым (__call__)
 #  - shim для generate: маппит prompt/img в именованные параметры
-#  - страховка: WAN_FORCE_BOUNDARY_OFF=1 мягко отключает boundary в рантайме
-#  - ДОБАВЛЕНО: FRAMES HOOK — WAN_FORCE_FRAMES=N мягко нормализует число кадров
+#  - WAN_FORCE_BOUNDARY_OFF=1 мягко отключает boundary в рантайме
+#  - WAN_FORCE_FRAMES=N: жёстко выставляет кадры в объекте/конфиге + пробрасывает kw
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_SITE'
 from pathlib import Path
 code = r'''
-# тишина: ничего не печатать из этого модуля
 import builtins, inspect, os
+
+def _force_frames(self, n:int):
+    for name in ('frame_num','num_frames','frames','length','video_frames','T'):
+        try: setattr(self, name, int(n))
+        except Exception: pass
+    for cfg_name in ('config','cfg','conf'):
+        c = getattr(self, cfg_name, None)
+        if c is None: continue
+        for name in ('frame_num','num_frames','frames','length','video_frames','T'):
+            try: setattr(c, name, int(n))
+            except Exception: pass
 
 def _patch_wani2v(mod):
     try:
@@ -28,7 +38,6 @@ def _patch_wani2v(mod):
         if cls is None:
             return
 
-        # 1) сделать класс вызываемым (__call__), делегируя на generate/infer/…
         if not hasattr(cls, "__call__"):
             def __call__(self, *a, **k):
                 for name in ("generate","infer","forward","run","predict","sample"):
@@ -38,11 +47,9 @@ def _patch_wani2v(mod):
                 raise TypeError("WanI2V is not callable and no known generate-like method was found")
             cls.__call__ = __call__
 
-        # 2) generate-shim: аккуратно маппим именованные аргументы
         gen = getattr(cls, "generate", None)
         if callable(gen) and not getattr(gen, "_shimmed_kwmap", False):
-            sig = inspect.signature(gen)
-            params = sig.parameters
+            sig = inspect.signature(gen); params = sig.parameters
             def _shim(self, *args, **kwargs):
                 if not args:
                     prompt = kwargs.pop('prompt', kwargs.pop('input_prompt', ''))
@@ -59,55 +66,43 @@ def _patch_wani2v(mod):
             _shim._shimmed_kwmap = True
             cls.generate = _shim
 
-        # 3) страховка: по env принудительно гасим boundary
         if os.environ.get("WAN_FORCE_BOUNDARY_OFF","0") == "1" and not getattr(cls, "_force_boundary_off", False):
             _orig = cls.generate
-            def _wrap(self, *a, **k):
-                try:
-                    self.boundary = 0  # безопасный «не None» бэкстоп
-                except Exception:
-                    pass
+            def _wrap_boundary(self, *a, **k):
+                try: self.boundary = 0
+                except Exception: pass
                 return _orig(self, *a, **k)
-            cls.generate = _wrap
+            cls.generate = _wrap_boundary
             cls._force_boundary_off = True
 
-        # --- FRAMES HOOK: мягко форсим число кадров под модель (например 12) ---
-        # WAN_FORCE_FRAMES=N → если задано, попытаться выставить num_frames/frames/length
-        # или скорректировать seconds так, чтобы fps*seconds ≈ N.
         if not getattr(cls, "_force_frames_hook", False):
-            _orig_gen = cls.generate
-            def _wrap_frames(self, *args, **kwargs):
-                try:
-                    want = int(os.environ.get("WAN_FORCE_FRAMES","0"))
-                except Exception:
-                    want = 0
-                if want > 0:
-                    import inspect
-                    sig = inspect.signature(_orig_gen)
-                    params = sig.parameters
-                    def has(name: str) -> bool:
-                        p = params.get(name)
-                        return p is not None and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-                    # 1) выставляем явные «кадровые» параметры, если метод их принимает
-                    applied = False
-                    for key in ("num_frames","video_frames","frame_num","frames","length"):
-                        if has(key):
-                            kwargs[key] = want
-                            applied = True
-                            break
-                    # 2) если управляется fps/seconds — подправим seconds под нужное число кадров
-                    if not applied:
-                        fps = kwargs.get("fps")
-                        if fps:
-                            try:
-                                fps = float(fps)
-                                kwargs["seconds"] = max(want / fps, 1.0 / fps)
-                            except Exception:
-                                pass
-                return _orig_gen(self, *args, **kwargs)
+            _orig = cls.generate
+            def _wrap_frames(self, *a, **k):
+                n = os.environ.get("WAN_FORCE_FRAMES")
+                if n:
+                    try: n = int(n)
+                    except Exception: n = None
+                if not n:
+                    for key in ("frame_num","num_frames","frames","length"):
+                        v = k.get(key)
+                        if v is not None:
+                            try: n = int(v); break
+                            except Exception: pass
+                if n:
+                    _force_frames(self, n)
+                    sig = inspect.signature(_orig)
+                    for key in ("frame_num","num_frames","frames","length"):
+                        if key in sig.parameters:
+                            k[key] = n; break
+                    if "fps" in k and "seconds" not in k:
+                        try:
+                            fps = float(k["fps"])
+                            if fps > 0: k["seconds"] = max(n / fps, 1.0 / fps)
+                        except Exception:
+                            pass
+                return _orig(self, *a, **k)
             cls.generate = _wrap_frames
             cls._force_frames_hook = True
-        # --- /FRAMES HOOK ---
 
     except Exception:
         pass
@@ -128,7 +123,7 @@ def _hook(name, globals=None, locals=None, fromlist=(), level=0):
 builtins.__import__ = _hook
 '''
 Path("/app/sitecustomize.py").write_text(code, encoding="utf-8")
-print("[start] wrote sitecustomize.py (quiet, __call__ + generate shim + boundary OFF hook + frames hook)")
+print("[start] wrote sitecustomize.py (callable, shim, boundary OFF, hard frames)")
 PY_SITE
 
 # -----------------------------------------------------------------------------
@@ -182,11 +177,9 @@ if not p.exists():
 else:
     s = p.read_text(encoding="utf-8")
 
-    # ensure import os
     if "import os" not in s:
         s = ("import os\n" + s) if "import torch" not in s else s.replace("import torch", "import torch\nimport os", 1)
 
-    # inject diffusers backend (WAN if present)
     if "_vae_build_diffusers" not in s:
         s += """
 
@@ -229,12 +222,10 @@ def _vae_build_diffusers(_device):
 """
         print("[patch] vae2_1.py: diffusers backend injected")
 
-    # rename original _video_vae -> _video_vae_orig (one time)
     if "_video_vae_orig" not in s and "def _video_vae(" in s:
         s = s.replace("def _video_vae(", "def _video_vae_orig(", 1)
         print("[patch] vae2_1.py: renamed _video_vae -> _video_vae_orig")
 
-    # hard override _video_vae (env-gated)
     if "def _video_vae(*_args, **_kwargs):" not in s:
         s += """
 
@@ -250,7 +241,6 @@ def _video_vae(*_args, **_kwargs):
 """
         print("[patch] vae2_1.py: hard override for _video_vae added")
 
-    # guard any model.load_state_dict(torch.load(pretrained_path...)) when USE_DIFFUSERS_VAE=1
     s2 = re.sub(
         r"(?m)^(?P<ind>\s*)model\.load_state_dict\(\s*torch\.load\(\s*pretrained_path.*$",
         r"\g<ind>if os.environ.get('USE_DIFFUSERS_VAE','0')!='1' and os.path.isfile(pretrained_path):\n"
@@ -262,7 +252,6 @@ def _video_vae(*_args, **_kwargs):
         s = s2
         print("[patch] vae2_1.py: guarded native .pth load")
 
-    # encode(): распаковка AutoencoderKLOutput
     pat = re.compile(
         r"""(self\.model\.encode\(\s*u\.unsqueeze\(0\)\s*,\s*self\.scale\s*\)\.float\(\)\.squeeze\(0\))""",
         re.VERBOSE
@@ -337,7 +326,6 @@ PY_NOISE
 
 # -----------------------------------------------------------------------------
 # image2video.py: глобальный безопасный патч boundary (normalize + compare helper)
-#   (исправлен импорт re)
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_BOUNDARY'
 from pathlib import Path
@@ -349,7 +337,6 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # helpers (вставим один раз, идемпотентно)
     helpers = r"""
 # --- safe boundary helpers (inserted) ---
 def _norm_boundary(self):
@@ -388,12 +375,10 @@ def _ge_boundary(t_item, boundary):
             s = helpers + "\n" + s
         changed = True
 
-    # normalize line: boundary = self.boundary * self.num_train_timesteps
     pat_mult = re.compile(r'^\s*boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$', re.M)
     if pat_mult.search(s):
         s = pat_mult.sub("boundary = _norm_boundary(self)", s); changed = True
 
-    # safe ternary (в одну строку)
     pat_tern = re.compile(
         r'^\s*sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]\s*$',
         re.M
@@ -404,11 +389,9 @@ def _ge_boundary(t_item, boundary):
     s2 = pat_tern.sub(repl_tern, s)
     if s2 != s: s = s2; changed = True
 
-    # safe if (в одну строку)
     s2 = re.sub(r'if\s+t\.item\(\)\s*>=\s*boundary\s*:', r'if _ge_boundary(t.item(), boundary):', s)
     if s2 != s: s = s2; changed = True
 
-    # если вообще не найдено умножение — локально материализуем boundary
     if "boundary = _norm_boundary(self)" not in s:
         s2 = re.sub(
             r"(?ms)^(\s*def\s+generate\s*\(.*?\):\s*\n)(\s*)(\S)",
@@ -431,7 +414,6 @@ PY_BOUNDARY
 
 # -----------------------------------------------------------------------------
 # ДОП. патч: многострочные варианты сравнения/тернарника с boundary
-#   (исправлен импорт re)
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_BOUNDARY_MULTILINE'
 from pathlib import Path
@@ -443,7 +425,6 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # многострочный тернарник
     pat_tern_ml = re.compile(
         r'(?P<ind>^[ \t]*)sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*'
         r'if\s*t\.item\(\s*[\s\S]*?\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\][ \t]*$',
@@ -457,7 +438,6 @@ else:
     if s2 != s:
         s = s2; changed = True
 
-    # многострочный if
     pat_if_ml = re.compile(
         r'(?P<ind>^[ \t]*)if\s*t\.item\(\s*[\s\S]*?\)\s*>=\s*boundary\s*:[ \t]*$',
         re.M
