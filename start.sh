@@ -1134,7 +1134,7 @@ def _ensure_latent_channels(sample, frame_num:int):
 PY_LATENT_CHAN_SYNC
 
 # -----------------------------------------------------------------------------
-# fm_solvers_unipc.py: выровнять каналы sample к model_output в convert_model_output
+# fm_solvers_unipc.py: inline-guard выравнивания каналов sample к model_output
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_SCHED_CHAN_GUARD'
 from pathlib import Path, re
@@ -1145,44 +1145,32 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) helper один раз
-    if "_align_channels_like(" not in s:
-        helper = r"""
-# --- inserted: align channels of A to B (trim/pad with noise) ---
-def _align_channels_like(a, b):
-    import torch
-    if not hasattr(a, "shape") or not hasattr(b, "shape"):
-        return a
-    if a.dim() < 2 or b.dim() < 2:
-        return a
-    ca = int(a.shape[1]); cb = int(b.shape[1])
-    if ca == cb:
-        return a
-    tail = a.shape[2:]
-    if ca > cb:
-        return a[:, :cb, ...]
-    # pad with fresh noise matching device/dtype
-    pad = torch.randn((a.shape[0], cb - ca, *tail), device=a.device, dtype=a.dtype)
-    return torch.cat([a, pad], dim=1)
-# --- end inserted ---
-"""
-        # вставим перед первой функцией
-        idx = s.find("def ")
-        if idx == -1:
-            idx = len(s)
-        s = s[:idx] + helper + s[idx:]
-        changed = True
-
-    # 2) в convert_model_output, перед x0_pred = sample - sigma_t * model_output
-    pat = re.compile(
-        r"(?P<ind>^[ \t]*)x0_pred\s*=\s*sample\s*-\s*sigma_t\s*\*\s*model_output\s*$",
-        re.M
+    # 1) Если ранее вставлялся хелпер, аккуратно удалим его (на будущее)
+    s = re.sub(
+        r"\n# --- inserted: align channels of A to B \(trim/pad with noise\) ---[\\s\\S]*?# --- end inserted ---\n",
+        "\n",
+        s, count=1
     )
+
+    # 2) Вставим ИНЛАЙН-guard прямо перед x0_pred = sample - sigma_t * model_output
+    pat = re.compile(r"(?P<ind>^[ \t]*)x0_pred\s*=\s*sample\s*-\s*sigma_t\s*\*\s*model_output\s*$", re.M)
     def repl(m):
         ind = m.group("ind")
         return (
-f"""{ind}# __CHAN_GUARD__: align sample channels to model_output
-{ind}sample = _align_channels_like(sample, model_output)
+f"""{ind}# __CHAN_GUARD_INLINE__: align sample channels to model_output
+{ind}try:
+{ind}    import torch
+{ind}    _ca = int(getattr(sample, 'shape', [0,0])[1]) if hasattr(sample,'shape') and sample.dim()>=2 else None
+{ind}    _cb = int(getattr(model_output, 'shape', [0,0])[1]) if hasattr(model_output,'shape') and model_output.dim()>=2 else None
+{ind}    if _ca is not None and _cb is not None and _ca != _cb:
+{ind}        if _ca > _cb:
+{ind}            sample = sample[:, :_cb, ...]
+{ind}        else:
+{ind}            _tail = sample.shape[2:]
+{ind}            _pad = torch.randn((sample.shape[0], _cb - _ca, *_tail), device=sample.device, dtype=sample.dtype)
+{ind}            sample = torch.cat([sample, _pad], dim=1)
+{ind}except Exception:
+{ind}    pass
 {ind}x0_pred = sample - sigma_t * model_output"""
         )
     s2, n = pat.subn(repl, s, count=1)
@@ -1191,10 +1179,9 @@ f"""{ind}# __CHAN_GUARD__: align sample channels to model_output
 
     if changed:
         p.write_text(s, encoding="utf-8")
-        print("[patch] fm_solvers_unipc.py: convert_model_output channel guard installed")
+        print("[patch] fm_solvers_unipc.py: inline channel guard installed")
     else:
-        print("[patch] fm_solvers_unipc.py: channel guard already present or pattern not found")
-PY_SCHED_CHAN_GUARD
+        print("[patch] fm_solvers_unipc.py: target pattern
 
 # -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
