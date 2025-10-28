@@ -968,6 +968,105 @@ f"""{ind}# __ATTN_O_GUARD__: если last-dim < in_features и кратен —
 PY_ATTN_O_GUARD
 
 # -----------------------------------------------------------------------------
+# model.py: SKIP cross-attn по env WAN_FORCE_NO_TEXT=1 или пустому промпту
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_SKIP_XATTN'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/modules/model.py")
+if not p.exists():
+    print("[patch][warn] model.py not found for skip-xattn")
+else:
+    s = p.read_text(encoding="utf-8")
+    # Меняем строку: x = x + self.cross_attn(self.norm3(x), context, context_lens)
+    pat = re.compile(r"(?m)^(\s*)x\s*=\s*x\s*\+\s*self\.cross_attn\(\s*self\.norm3\(x\)\s*,\s*context\s*,\s*context_lens\s*\)\s*$")
+    def repl(m):
+        ind = m.group(1)
+        return (
+f"""{ind}# __SKIP_XATTN__: по флагу окольцовываем без cross-attn
+{ind}import os as _os
+{ind}_skip = _os.environ.get("WAN_FORCE_NO_TEXT","0") == "1"
+{ind}if (context is None) or _skip:
+{ind}    x = x  # пропускаем cross-attn
+{ind}else:
+{ind}    x = x + self.cross_attn(self.norm3(x), context, context_lens)"""
+        )
+    s2, n = pat.subn(repl, s, count=1)
+    if n > 0:
+        p.write_text(s2, encoding="utf-8")
+        print("[patch] model.py: SKIP_XATTN installed")
+    else:
+        print("[patch] model.py: pattern for SKIP_XATTN not found (maybe already patched?)")
+PY_SKIP_XATTN
+
+# -----------------------------------------------------------------------------
+# model.py: CROSS-BATCH ALIGN в WanCrossAttention.forward (Q vs K/V)
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_CROSS_BATCH_ALIGN'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/modules/model.py")
+if not p.exists():
+    print("[patch][warn] model.py not found for cross-batch align")
+else:
+    s = p.read_text(encoding="utf-8")
+    # Вариант А: заменяем сам вызов flash_attention(...)
+    patA = re.compile(r"(?m)^(\s*)x\s*=\s*flash_attention\(\s*q\s*,\s*k\s*,\s*v\s*,\s*k_lens\s*=\s*context_lens\s*\)\s*$")
+    def replA(m):
+        ind = m.group(1)
+        return (
+f"""{ind}# __CROSS_BATCH_ALIGN__: выровнять batch-ось Q vs K/V
+{ind}if q.shape[0] != k.shape[0]:
+{ind}    import torch
+{ind}    bq, bk = q.shape[0], k.shape[0]
+{ind}    if bk == 1:
+{ind}        k = k.expand(bq, -1, -1)
+{ind}        v = v.expand(bq, -1, -1)
+{ind}    elif bq % bk == 0:
+{ind}        rep = bq // bk
+{ind}        k = torch.repeat_interleave(k, rep, dim=0)
+{ind}        v = torch.repeat_interleave(v, rep, dim=0)
+{ind}x = flash_attention(q, k, v, k_lens=context_lens)"""
+        )
+    s2, nA = patA.subn(replA, s, count=1)
+    if nA == 0:
+        # Вариант B: вставка перед flash_attention(...) внутри WanCrossAttention.forward
+        # Найдём функцию forward класса WanCrossAttention
+        patHead = re.compile(r"(?ms)^class\s+WanCrossAttention\b.*?^\s*def\s+forward\s*\(\s*self\s*,\s*x\s*,\s*context\s*,\s*context_lens\s*\)\s*:\s*\n")
+        mHead = patHead.search(s)
+        if mHead:
+            insert_pos = mHead.end()
+            # Вставим блок выравнивания прямо перед первым вызовом flash_attention
+            patCall = re.compile(r"(?m)^(\s*)x\s*=\s*flash_attention\(")
+            mCall = patCall.search(s, pos=insert_pos)
+            if mCall:
+                ind = mCall.group(1)
+                guard = (
+f"""{ind}# __CROSS_BATCH_ALIGN__: выровнять batch-ось Q vs K/V (in-forward)
+{ind}if q.shape[0] != k.shape[0]:
+{ind}    import torch
+{ind}    bq, bk = q.shape[0], k.shape[0]
+{ind}    if bk == 1:
+{ind}        k = k.expand(bq, -1, -1)
+{ind}        v = v.expand(bq, -1, -1)
+{ind}    elif bq % bk == 0:
+{ind}        rep = bq // bk
+{ind}        k = torch.repeat_interleave(k, rep, dim=0)
+{ind}        v = torch.repeat_interleave(v, rep, dim=0)
+"""
+                )
+                s2 = s[:mCall.start()] + guard + s[mCall.start():]
+                nA = 1
+            else:
+                s2 = s
+        else:
+            s2 = s
+    if s2 != s and nA > 0:
+        p.write_text(s2, encoding="utf-8")
+        print("[patch] model.py: cross-attn batch align installed")
+    else:
+        print("[patch] model.py: could not install cross-batch align (pattern mismatch?)")
+PY_CROSS_BATCH_ALIGN
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
