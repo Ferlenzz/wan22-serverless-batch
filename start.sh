@@ -477,6 +477,39 @@ else:
 PY_BOUNDARY_MULTILINE
 
 # -----------------------------------------------------------------------------
+# image2video.py: MASK FIX — выровнять число каналов маски до кратного 4
+# и синхронизировать frame_num, прежде чем делать view(..., //4, 4, ...)
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_MASK_FIX'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/image2video.py")
+if not p.exists():
+    print("[patch][warn] image2video.py not found for mask-fix")
+else:
+    s = p.read_text(encoding="utf-8")
+    # Ищем строку: msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+    pat = re.compile(r"""msk\s*=\s*msk\.view\(\s*1\s*,\s*msk\.shape\[1\]\s*//\s*4\s*,\s*4\s*,\s*lat_h\s*,\s*lat_w\s*\)""")
+    if pat.search(s) and "##__MASK_CHANNEL_GUARD__" not in s:
+        s = pat.sub(
+            "##__MASK_CHANNEL_GUARD__\n"
+            "_C = int(msk.shape[1])\n"
+            "if (_C % 4) != 0:\n"
+            "    _C_trim = _C - (_C % 4)\n"
+            "    print(f\"[mask] trim channels: {_C} -> {_C_trim} (not divisible by 4)\")\n"
+            "    msk = msk[:, :_C_trim, ...]\n"
+            "    _C = _C_trim\n"
+            "try:\n"
+            "    self.frame_num = int(_C // 4)\n"
+            "except Exception:\n"
+            "    pass\n"
+            "msk = msk.view(1, _C // 4, 4, lat_h, lat_w)", s)
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: mask channels guard added")
+    else:
+        print("[patch] image2video.py: mask guard already present or pattern not found")
+PY_MASK_FIX
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
