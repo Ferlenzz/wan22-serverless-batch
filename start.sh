@@ -13,7 +13,6 @@ export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 # sitecustomize.py (тихий):
 #  - делает WanI2V вызываемым (__call__)
 #  - shim для generate: маппит prompt/img в именованные параметры
-#    (без логики boundary здесь, чтобы не конфликтовать с патчами ниже)
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_SITE'
 from pathlib import Path
@@ -376,38 +375,43 @@ def _ge_boundary(t_item, boundary):
         print("[patch] image2video.py: boundary already patched")
 PY_BOUNDARY
 
-python3 - <<'PY'
+# -----------------------------------------------------------------------------
+# re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_REINDENT'
 from pathlib import Path
 p = Path("/app/Wan2.2/wan/image2video.py")
-s = p.read_text(encoding="utf-8")
-lines = s.splitlines()
+if p.exists():
+    s = p.read_text(encoding="utf-8")
+    lines = s.splitlines()
 
-def leading_spaces(t): 
-    return len(t) - len(t.lstrip(' '))
+    def leading_spaces(t): 
+        return len(t) - len(t.lstrip(' '))
 
-changed = False
-for i, line in enumerate(lines):
-    if line.strip() == "boundary = _norm_boundary(self)":
-        # ищем ближайшую предшествующую непустую строку
-        j = i - 1
-        while j >= 0 and lines[j].strip() == "":
-            j -= 1
-        if j >= 0:
-            prev = lines[j]
-            # если предыдущая строка — это 'with ...:' (любой контекстный менеджер)
-            if prev.strip().startswith("with ") and prev.rstrip().endswith(":"):
-                want_indent = leading_spaces(prev) + 4
-                have_indent = leading_spaces(line)
-                if have_indent != want_indent:
-                    lines[i] = " " * want_indent + "boundary = _norm_boundary(self)"
-                    changed = True
+    changed = False
+    for i, line in enumerate(lines):
+        if line.strip() == "boundary = _norm_boundary(self)":
+            # ищем ближайшую предшествующую непустую строку
+            j = i - 1
+            while j >= 0 and lines[j].strip() == "":
+                j -= 1
+            if j >= 0:
+                prev = lines[j]
+                if prev.strip().startswith("with ") and prev.rstrip().endswith(":"):
+                    want_indent = leading_spaces(prev) + 4
+                    have_indent = leading_spaces(line)
+                    if have_indent != want_indent:
+                        lines[i] = " " * want_indent + "boundary = _norm_boundary(self)"
+                        changed = True
 
-if changed:
-    p.write_text("\n".join(lines) + ("\n" if s.endswith("\n") else ""), encoding="utf-8")
-    print("[fix] re-indented 'boundary = _norm_boundary(self)' under its 'with' block")
+    if changed:
+        p.write_text("\n".join(lines) + ("\n" if s.endswith("\n") else ""), encoding="utf-8")
+        print("[fix] re-indented 'boundary = _norm_boundary(self)' under its 'with' block")
+    else:
+        print("[fix] nothing to change (already well-indented or pattern not found)")
 else:
-    print("[fix] nothing to change (already well-indented or pattern not found)")
-PY
+    print("[fix][warn] image2video.py not found for reindent")
+PY_REINDENT
 
 # -----------------------------------------------------------------------------
 # Запуск хэндлера
