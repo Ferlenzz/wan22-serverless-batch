@@ -14,6 +14,7 @@ export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 #  - делает WanI2V вызываемым (__call__)
 #  - shim для generate: маппит prompt/img в именованные параметры
 #  - страховка: WAN_FORCE_BOUNDARY_OFF=1 мягко отключает boundary в рантайме
+#  - ДОБАВЛЕНО: FRAMES HOOK — WAN_FORCE_FRAMES=N мягко нормализует число кадров
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_SITE'
 from pathlib import Path
@@ -70,6 +71,44 @@ def _patch_wani2v(mod):
             cls.generate = _wrap
             cls._force_boundary_off = True
 
+        # --- FRAMES HOOK: мягко форсим число кадров под модель (например 12) ---
+        # WAN_FORCE_FRAMES=N → если задано, попытаться выставить num_frames/frames/length
+        # или скорректировать seconds так, чтобы fps*seconds ≈ N.
+        if not getattr(cls, "_force_frames_hook", False):
+            _orig_gen = cls.generate
+            def _wrap_frames(self, *args, **kwargs):
+                try:
+                    want = int(os.environ.get("WAN_FORCE_FRAMES","0"))
+                except Exception:
+                    want = 0
+                if want > 0:
+                    import inspect
+                    sig = inspect.signature(_orig_gen)
+                    params = sig.parameters
+                    def has(name: str) -> bool:
+                        p = params.get(name)
+                        return p is not None and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                    # 1) выставляем явные «кадровые» параметры, если метод их принимает
+                    applied = False
+                    for key in ("num_frames","video_frames","frame_num","frames","length"):
+                        if has(key):
+                            kwargs[key] = want
+                            applied = True
+                            break
+                    # 2) если управляется fps/seconds — подправим seconds под нужное число кадров
+                    if not applied:
+                        fps = kwargs.get("fps")
+                        if fps:
+                            try:
+                                fps = float(fps)
+                                kwargs["seconds"] = max(want / fps, 1.0 / fps)
+                            except Exception:
+                                pass
+                return _orig_gen(self, *args, **kwargs)
+            cls.generate = _wrap_frames
+            cls._force_frames_hook = True
+        # --- /FRAMES HOOK ---
+
     except Exception:
         pass
 
@@ -89,7 +128,7 @@ def _hook(name, globals=None, locals=None, fromlist=(), level=0):
 builtins.__import__ = _hook
 '''
 Path("/app/sitecustomize.py").write_text(code, encoding="utf-8")
-print("[start] wrote sitecustomize.py (quiet, __call__ + generate shim + boundary OFF hook)")
+print("[start] wrote sitecustomize.py (quiet, __call__ + generate shim + boundary OFF hook + frames hook)")
 PY_SITE
 
 # -----------------------------------------------------------------------------
@@ -298,9 +337,11 @@ PY_NOISE
 
 # -----------------------------------------------------------------------------
 # image2video.py: глобальный безопасный патч boundary (normalize + compare helper)
+#   (исправлен импорт re)
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_BOUNDARY'
-from pathlib import Path, re
+from pathlib import Path
+import re
 p = Path("/app/Wan2.2/wan/image2video.py")
 if not p.exists():
     print("[patch][warn] not found:", p)
@@ -390,9 +431,11 @@ PY_BOUNDARY
 
 # -----------------------------------------------------------------------------
 # ДОП. патч: многострочные варианты сравнения/тернарника с boundary
+#   (исправлен импорт re)
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_BOUNDARY_MULTILINE'
-from pathlib import Path, re
+from pathlib import Path
+import re
 p = Path("/app/Wan2.2/wan/image2video.py")
 if not p.exists():
     print("[patch][warn] not found:", p)
