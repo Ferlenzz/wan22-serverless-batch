@@ -385,7 +385,7 @@ if p.exists():
     s = p.read_text(encoding="utf-8")
     lines = s.splitlines()
 
-    def leading_spaces(t): 
+    def leading_spaces(t):
         return len(t) - len(t.lstrip(' '))
 
     changed = False
