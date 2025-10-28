@@ -791,6 +791,64 @@ else:
 PY_ATTN_ISCAUSAL_FIX
 
 # -----------------------------------------------------------------------------
+# attention.py: SDPA merge heads -> (B, T, H*D) to match Linear(3072,3072)
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_ATTN_RETURN_SHAPE'
+from pathlib import Path
+import re
+p = Path("/app/Wan2.2/wan/modules/attention.py")
+if not p.exists():
+    print("[patch][warn] attention.py not found for return-shape fix")
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # 1) Вставим helper для слияния голов (один раз)
+    if "def _wan_sdpa_merge(" not in s:
+        helper = r"""
+
+# === inserted: sdpa merge to (B,T,H*D) ===
+def _wan_sdpa_merge(q, k, v, dropout_p=0.0, is_causal=False):
+    # q,k,v ожидаются как (B,H,T,D)
+    out = _wan_sdpa_safe(q, k, v, dropout_p, False)  # non-causal
+    B, H, T, D = out.shape
+    # (B,H,T,D) -> (B,T,H,D) -> (B,T,H*D)
+    out = out.transpose(1, 2).contiguous().view(B, T, H * D)
+    return out
+# === end inserted ===
+"""
+        # Вставим helper перед первой декларацией класса/функции
+        idx = s.find("class ")
+        if idx == -1:
+            idx = s.find("def ")
+        if idx != -1:
+            s = s[:idx] + helper + s[idx:]
+            changed = True
+
+    # 2) Заменим блок нашего фолбэка, чтобы возвращать слитую форму
+    pat = re.compile(
+        r"(?ms)^([ \t]*)##__SDPA_FALLBACK__\s*\n\1if not FLASH_ATTN_2_AVAILABLE:\s*\n.*?return[^\n]*$"
+    )
+    def repl(m):
+        ind = m.group(1)
+        return (
+            f"{ind}##__SDPA_FALLBACK__\n"
+            f"{ind}if not FLASH_ATTN_2_AVAILABLE:\n"
+            f"{ind}    return _wan_sdpa_merge(q, k, v, dropout_p, False)"
+        )
+    s2 = pat.sub(repl, s)
+    if s2 != s:
+        s = s2
+        changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] attention.py: SDPA now returns (B,T,H*D)")
+    else:
+        print("[patch] attention.py: return-shape already correct or markers not found")
+PY_ATTN_RETURN_SHAPE
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
