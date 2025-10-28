@@ -2,7 +2,7 @@ name: Build & Push (fast)
 
 on:
   push:
-    branches: [ "main" ]      # триггер только от пуша в main
+    branches: [ "main" ]    
   workflow_dispatch: {}
 
 jobs:
@@ -13,7 +13,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Buildx нужен для кэша; QEMU не нужен (мы собираем amd64 на amd64)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -30,15 +29,11 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
-          # максимально ускоряем за счёт кэша
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # для скорости обычно НЕ тянем свежие базовые слои
           pull: false
-          # теги — только latest (и, по желанию, sha)
           tags: |
             ferlenzz/wan22-serverless-batch:latest
             ferlenzz/wan22-serverless-batch:${{ github.sha }}
-          # опционально: фикс ревизии Wan2.2 (ускорит за счёт стабильного кэша)
           build-args: |
             WAN_REF=main
