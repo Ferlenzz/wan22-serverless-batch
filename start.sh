@@ -1134,54 +1134,62 @@ def _ensure_latent_channels(sample, frame_num:int):
 PY_LATENT_CHAN_SYNC
 
 # -----------------------------------------------------------------------------
-# fm_solvers_unipc.py: inline-guard выравнивания каналов sample к model_output
+# fm_solvers_unipc.py: выровнять каналы sample к model_output в convert_model_output (фикс отступов)
 # -----------------------------------------------------------------------------
-${PYBIN} - <<'PY_SCHED_CHAN_GUARD'
+${PYBIN} - <<'PY_SCHED_CHAN_GUARD_FIX'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/utils/fm_solvers_unipc.py")
 if not p.exists():
-    print("[patch][warn] fm_solvers_unipc.py not found for scheduler channel guard")
+    print("[patch][warn] fm_solvers_unipc.py not found for scheduler channel guard (fix)")
 else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) Если ранее вставлялся хелпер, аккуратно удалим его (на будущее)
-    s = re.sub(
-        r"\n# --- inserted: align channels of A to B \(trim/pad with noise\) ---[\\s\\S]*?# --- end inserted ---\n",
-        "\n",
-        s, count=1
-    )
+    # 1) Гарантируем helper на уровне модуля (в КОНЦЕ файла) — без шансов попасть внутрь функции/класса
+    if "_align_channels_like(" not in s:
+        helper = (
+            "\n\n"
+            "# --- inserted: align channels of A to B (trim/pad with noise) ---\n"
+            "def _align_channels_like(a, b):\n"
+            "    import torch\n"
+            "    if not hasattr(a, 'shape') or not hasattr(b, 'shape'):\n"
+            "        return a\n"
+            "    if a.dim() < 2 or b.dim() < 2:\n"
+            "        return a\n"
+            "    ca = int(a.shape[1]); cb = int(b.shape[1])\n"
+            "    if ca == cb:\n"
+            "        return a\n"
+            "    tail = a.shape[2:]\n"
+            "    if ca > cb:\n"
+            "        return a[:, :cb, ...]\n"
+            "    pad = torch.randn((a.shape[0], cb - ca, *tail), device=a.device, dtype=a.dtype)\n"
+            "    return torch.cat([a, pad], dim=1)\n"
+            "# --- end inserted ---\n"
+        )
+        s = s.rstrip() + helper
+        changed = True
 
-    # 2) Вставим ИНЛАЙН-guard прямо перед x0_pred = sample - sigma_t * model_output
-    pat = re.compile(r"(?P<ind>^[ \t]*)x0_pred\s*=\s*sample\s*-\s*sigma_t\s*\*\s*model_output\s*$", re.M)
+    # 2) Патчим первую строку с x0_pred = sample - sigma_t * model_output
+    pat = re.compile(r"(?m)^(?P<ind>[ \t]*)x0_pred\s*=\s*sample\s*-\s*sigma_t\s*\*\s*model_output\s*$")
     def repl(m):
         ind = m.group("ind")
         return (
-f"""{ind}# __CHAN_GUARD_INLINE__: align sample channels to model_output
-{ind}try:
-{ind}    import torch
-{ind}    _ca = int(getattr(sample, 'shape', [0,0])[1]) if hasattr(sample,'shape') and sample.dim()>=2 else None
-{ind}    _cb = int(getattr(model_output, 'shape', [0,0])[1]) if hasattr(model_output,'shape') and model_output.dim()>=2 else None
-{ind}    if _ca is not None and _cb is not None and _ca != _cb:
-{ind}        if _ca > _cb:
-{ind}            sample = sample[:, :_cb, ...]
-{ind}        else:
-{ind}            _tail = sample.shape[2:]
-{ind}            _pad = torch.randn((sample.shape[0], _cb - _ca, *_tail), device=sample.device, dtype=sample.dtype)
-{ind}            sample = torch.cat([sample, _pad], dim=1)
-{ind}except Exception:
-{ind}    pass
-{ind}x0_pred = sample - sigma_t * model_output"""
+            f"{ind}# __CHAN_GUARD__: align sample channels to model_output\n"
+            f"{ind}sample = _align_channels_like(sample, model_output)\n"
+            f"{ind}x0_pred = sample - sigma_t * model_output"
         )
     s2, n = pat.subn(repl, s, count=1)
     if n > 0:
-        s = s2; changed = True
+        s = s2
+        changed = True
 
     if changed:
         p.write_text(s, encoding="utf-8")
-        print("[patch] fm_solvers_unipc.py: inline channel guard installed")
+        print("[patch] fm_solvers_unipc.py: channel guard (append+replace) OK")
     else:
-        print("[patch] fm_solvers_unipc.py: target pattern
+        print("[patch] fm_solvers_unipc.py: already OK (no changes)")
+PY_SCHED_CHAN_GUARD_FIX
+
 
 # -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
