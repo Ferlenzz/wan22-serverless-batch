@@ -12,29 +12,14 @@ export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 # -----------------------------------------------------------------------------
 # sitecustomize.py (тихий):
 #  - делает WanI2V вызываемым (__call__)
-#  - shim для generate: нормализует self.boundary и маппит prompt/img по именам
+#  - shim для generate: маппит prompt/img в именованные параметры
+#    (без логики boundary здесь, чтобы не конфликтовать с патчами ниже)
 # -----------------------------------------------------------------------------
-${PYBIN} - <<'PY'
+${PYBIN} - <<'PY_SITE'
 from pathlib import Path
 code = r'''
-# не печатать из этого файла
+# тишина: ничего не печатать из этого модуля
 import builtins, inspect
-
-def _normalize_boundary(self):
-    try:
-        b = getattr(self, 'boundary', None)
-        n = int(getattr(self, 'num_train_timesteps', 1000))
-        if isinstance(b, dict) or hasattr(b, 'get'):
-            if not b.get('enabled', False):
-                return None
-            lo = int(max(0, min(1, float(b.get('lower', 0.0)))) * n)
-            up = int(max(0, min(1, float(b.get('upper', 1.0)))) * n)
-            return (lo, up)
-        if b is None:
-            return None
-        return int(float(b) * n) if isinstance(b, (int, float, str)) else None
-    except Exception:
-        return None
 
 def _patch_wani2v(mod):
     try:
@@ -52,32 +37,25 @@ def _patch_wani2v(mod):
                 raise TypeError("WanI2V is not callable and no known generate-like method was found")
             cls.__call__ = __call__
 
-        # 2) generate-shim: нормализуем boundary и маппим именованные аргументы
+        # 2) generate-shim: аккуратно маппим именованные аргументы
         gen = getattr(cls, "generate", None)
-        if callable(gen) and not getattr(gen, "_shimmed_kwmap_boundary", False):
+        if callable(gen) and not getattr(gen, "_shimmed_kwmap", False):
             sig = inspect.signature(gen)
             params = sig.parameters
             def _shim(self, *args, **kwargs):
-                nb = _normalize_boundary(self)
-                try: object.__setattr__(self, 'boundary', nb)
-                except Exception: setattr(self, 'boundary', nb)
-
                 if not args:
                     prompt = kwargs.pop('prompt', kwargs.pop('input_prompt', ''))
                     img    = kwargs.pop('img', kwargs.pop('image', None))
                     call_kwargs = dict(kwargs)
-
                     if 'prompt' in params: call_kwargs['prompt'] = prompt
                     elif 'input_prompt' in params: call_kwargs['input_prompt'] = prompt
-
                     if img is not None:
                         if 'img' in params: call_kwargs['img'] = img
                         elif 'image' in params: call_kwargs['image'] = img
                         elif 'x' in params: call_kwargs['x'] = [img]
-
                     return gen(self, **call_kwargs)
                 return gen(self, *args, **kwargs)
-            _shim._shimmed_kwmap_boundary = True
+            _shim._shimmed_kwmap = True
             cls.generate = _shim
 
     except Exception:
@@ -99,13 +77,13 @@ def _hook(name, globals=None, locals=None, fromlist=(), level=0):
 builtins.__import__ = _hook
 '''
 Path("/app/sitecustomize.py").write_text(code, encoding="utf-8")
-print("[start] wrote sitecustomize.py (generate shim + boundary normalization)")
-PY
+print("[start] wrote sitecustomize.py (quiet, __call__ + generate shim)")
+PY_SITE
 
 # -----------------------------------------------------------------------------
 # Диагностика
 # -----------------------------------------------------------------------------
-${PYBIN} - <<'PYINFO'
+${PYBIN} - <<'PY_INFO'
 import platform, os
 try:
     import torch; tv = torch.__version__
@@ -119,12 +97,12 @@ for k in ("USE_DIFFUSERS_VAE","WAN_VAE_REPO","WAN_VAE_SUBFOLDER","WAN_VAE_FILENA
     v = os.environ.get(k)
     if v is not None:
         print(f"[env] {k} = {v}")
-PYINFO
+PY_INFO
 
 # -----------------------------------------------------------------------------
 # Гарантируем diffusers >= 0.35 (не даунгрейдим)
 # -----------------------------------------------------------------------------
-${PYBIN} - <<'PYDIF'
+${PYBIN} - <<'PY_DIF'
 import sys, subprocess
 from packaging.version import Version
 def run(*args): subprocess.check_call([sys.executable,"-m","pip",*args])
@@ -138,12 +116,12 @@ try:
 except Exception:
     print("[start] installing diffusers>=0.35.0 ...")
     run("install","-q","--upgrade","diffusers>=0.35.0")
-PYDIF
+PY_DIF
 
 # -----------------------------------------------------------------------------
-# vae2_1.py: diffusers VAE backend + hard override _video_vae + guard .pth
+# vae2_1.py: diffusers VAE backend + hard override _video_vae + guard .pth + encode unwrap
 # -----------------------------------------------------------------------------
-${PYBIN} - <<'PYPATCH_VAE'
+${PYBIN} - <<'PY_VAE'
 from pathlib import Path
 import re, os
 
@@ -153,9 +131,11 @@ if not p.exists():
 else:
     s = p.read_text(encoding="utf-8")
 
+    # ensure import os
     if "import os" not in s:
         s = ("import os\n" + s) if "import torch" not in s else s.replace("import torch", "import torch\nimport os", 1)
 
+    # inject diffusers backend (WAN if present)
     if "_vae_build_diffusers" not in s:
         s += """
 
@@ -198,10 +178,12 @@ def _vae_build_diffusers(_device):
 """
         print("[patch] vae2_1.py: diffusers backend injected")
 
+    # rename original _video_vae -> _video_vae_orig (one time)
     if "_video_vae_orig" not in s and "def _video_vae(" in s:
         s = s.replace("def _video_vae(", "def _video_vae_orig(", 1)
         print("[patch] vae2_1.py: renamed _video_vae -> _video_vae_orig")
 
+    # hard override _video_vae (env-gated)
     if "def _video_vae(*_args, **_kwargs):" not in s:
         s += """
 
@@ -217,6 +199,7 @@ def _video_vae(*_args, **_kwargs):
 """
         print("[patch] vae2_1.py: hard override for _video_vae added")
 
+    # guard any model.load_state_dict(torch.load(pretrained_path...)) when USE_DIFFUSERS_VAE=1
     s2 = re.sub(
         r"(?m)^(?P<ind>\s*)model\.load_state_dict\(\s*torch\.load\(\s*pretrained_path.*$",
         r"\g<ind>if os.environ.get('USE_DIFFUSERS_VAE','0')!='1' and os.path.isfile(pretrained_path):\n"
@@ -228,13 +211,42 @@ def _video_vae(*_args, **_kwargs):
         s = s2
         print("[patch] vae2_1.py: guarded native .pth load")
 
+    # encode(): распаковка AutoencoderKLOutput
+    pat = re.compile(
+        r"""(self\.model\.encode\(\s*u\.unsqueeze\(0\)\s*,\s*self\.scale\s*\)\.float\(\)\.squeeze\(0\))""",
+        re.VERBOSE
+    )
+    if pat.search(s):
+        s = pat.sub(
+            "(_out := self.model.encode(u.unsqueeze(0), self.scale), "
+            "_tmp := (getattr(_out, 'latent_dist', None).mode() if getattr(_out, 'latent_dist', None) is not None "
+            "else (getattr(_out, 'latents', None) if getattr(_out, 'latents', None) is not None else _out)), "
+            "_tmp.float().squeeze(0))[-1]",
+            s
+        )
+        print("[patch] vae2_1.py: encode() unwrap applied")
+    else:
+        pat2 = re.compile(
+            r"""(self\.model\.encode\(\s*u\.unsqueeze\(0\)\s*,\s*self\.scale\s*\)\.float\(\))""",
+            re.VERBOSE
+        )
+        if pat2.search(s):
+            s = pat2.sub(
+                "(_out := self.model.encode(u.unsqueeze(0), self.scale), "
+                "_tmp := (getattr(_out, 'latent_dist', None).mode() if getattr(_out, 'latent_dist', None) is not None "
+                "else (getattr(_out, 'latents', None) if getattr(_out, 'latents', None) is not None else _out)), "
+                "_tmp.float())[-1]",
+                s
+            )
+            print("[patch] vae2_1.py: encode() unwrap applied (variant)")
+
     p.write_text(s, encoding="utf-8")
-PYPATCH_VAE
+PY_VAE
 
 # -----------------------------------------------------------------------------
 # image2video.py: low/high_noise_checkpoint опциональны (ENV-aware)
 # -----------------------------------------------------------------------------
-${PYBIN} - <<'PYPATCH_NOISE'
+${PYBIN} - <<'PY_NOISE'
 from pathlib import Path
 import re, os
 
@@ -270,60 +282,12 @@ if p.exists():
         print("[patch] image2video.py: already ok")
 else:
     print("[patch][warn] not found:", p)
-PYPATCH_NOISE
+PY_NOISE
 
 # -----------------------------------------------------------------------------
-# vae2_1.py: совместимость с diffusers AutoencoderKLOutput в encode()
+# image2video.py: глобальный безопасный патч boundary (normalize + compare helper)
 # -----------------------------------------------------------------------------
-${PYBIN} - <<'PYPATCH_ENCODE'
-from pathlib import Path, re
-
-p = Path("/app/Wan2.2/wan/modules/vae2_1.py")
-if not p.exists():
-    print("[patch][warn] not found:", p)
-else:
-    s = p.read_text(encoding="utf-8")
-    changed = False
-
-    pat = re.compile(
-        r"""(self\.model\.encode\(\s*u\.unsqueeze\(0\)\s*,\s*self\.scale\s*\)\.float\(\)\.squeeze\(0\))""",
-        re.VERBOSE
-    )
-    if pat.search(s):
-        s = pat.sub(
-            "(_out := self.model.encode(u.unsqueeze(0), self.scale), "
-            "_tmp := (getattr(_out, 'latent_dist', None).mode() if getattr(_out, 'latent_dist', None) is not None "
-            "else (getattr(_out, 'latents', None) if getattr(_out, 'latents', None) is not None else _out)), "
-            "_tmp.float().squeeze(0))[-1]",
-            s
-        )
-        changed = True
-    else:
-        pat2 = re.compile(
-            r"""(self\.model\.encode\(\s*u\.unsqueeze\(0\)\s*,\s*self\.scale\s*\)\.float\(\))""",
-            re.VERBOSE
-        )
-        if pat2.search(s):
-            s = pat2.sub(
-                "(_out := self.model.encode(u.unsqueeze(0), self.scale), "
-                "_tmp := (getattr(_out, 'latent_dist', None).mode() if getattr(_out, 'latent_dist', None) is not None "
-                "else (getattr(_out, 'latents', None) if getattr(_out, 'latents', None) is not None else _out)), "
-                "_tmp.float())[-1]",
-                s
-            )
-            changed = True
-
-    if changed:
-        p.write_text(s, encoding="utf-8")
-        print("[patch] vae2_1.py: encode() now unwraps AutoencoderKLOutput")
-    else:
-        print("[patch] vae2_1.py: encode() patch not applied (pattern not found) — maybe already patched?")
-PYPATCH_ENCODE
-
-# -----------------------------------------------------------------------------
-# image2video.py: ГЛОБАЛЬНЫЙ безопасный патч сравнения с boundary + локальная boundary
-# -----------------------------------------------------------------------------
-${PYBIN} - <<'PYPATCH_BOUNDARY_GLOBAL'
+${PYBIN} - <<'PY_BOUNDARY'
 from pathlib import Path, re
 p = Path("/app/Wan2.2/wan/image2video.py")
 if not p.exists():
@@ -332,10 +296,24 @@ else:
     s = p.read_text(encoding="utf-8")
     changed = False
 
-    # 1) Вставим safe helper один раз (после первых импортов)
-    helper = r"""
-# --- safe boundary compare helper (None | int | tuple(lo, up)) ---
-def _cmp_ge_boundary(t_val, boundary):
+    # helpers (вставим один раз, идемпотентно)
+    helpers = r"""
+# --- safe boundary helpers (inserted) ---
+def _norm_boundary(self):
+    _b = getattr(self, 'boundary', None)
+    _n = int(getattr(self, 'num_train_timesteps', 1000))
+    if isinstance(_b, dict) or hasattr(_b, 'get'):
+        if not _b.get('enabled', False):
+            return None
+        lo = int(max(0, min(1, float(_b.get('lower', 0.0)))) * _n)
+        up = int(max(0, min(1, float(_b.get('upper', 1.0)))) * _n)
+        return (lo, up)
+    try:
+        return int(float(_b) * _n)
+    except Exception:
+        return None
+
+def _ge_boundary(t_item, boundary):
     if boundary is None:
         return False
     if isinstance(boundary, tuple):
@@ -343,81 +321,60 @@ def _cmp_ge_boundary(t_val, boundary):
             _, up = boundary
         except Exception:
             up = int(boundary[1]) if hasattr(boundary,'__len__') and len(boundary) > 1 else 0
-        try:
-            return t_val >= int(up)
-        except Exception:
-            return False
+        return t_item >= up
     try:
-        return t_val >= int(boundary)
+        return t_item >= int(boundary)
     except Exception:
         return False
+# --- end helpers ---
 """
-    if "_cmp_ge_boundary(" not in s:
-        s = re.sub(r"^(import[^\n]+\n(?:from[^\n]+\n)*)", r"\1"+helper+"\n", s, count=1, flags=re.M)
+    if "_norm_boundary(" not in s:
+        if "class WanI2V" in s:
+            s = s.replace("class WanI2V", helpers + "\nclass WanI2V", 1)
+        else:
+            s = helpers + "\n" + s
         changed = True
 
-    # 2) Тернарники "guide_scale[1] if t.item() >= boundary else guide_scale[0]"
-    s2 = re.sub(
-        r"guide_scale\[\s*1\s*\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]",
-        r"guide_scale[1] if _cmp_ge_boundary(t.item(), boundary) else guide_scale[0]",
-        s
+    # normalize line: boundary = self.boundary * self.num_train_timesteps
+    pat_mult = re.compile(r'^\s*boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$', re.M)
+    if pat_mult.search(s):
+        s = pat_mult.sub("boundary = _norm_boundary(self)", s); changed = True
+
+    # safe ternary: sample_guide_scale = guide_scale[1] if t.item() >= boundary else guide_scale[0]
+    pat_tern = re.compile(
+        r'^\s*sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]\s*$',
+        re.M
     )
+    def repl_tern(m):
+        ind = m.group(0)[:len(m.group(0)) - len(m.group(0).lstrip())]
+        return f"{ind}_cond = _ge_boundary(t.item(), boundary)\n{ind}sample_guide_scale = guide_scale[1] if _cond else guide_scale[0]"
+    s2 = pat_tern.sub(repl_tern, s)
     if s2 != s: s = s2; changed = True
 
-    # 3) Любые "if t.item() >= boundary:"
-    s2 = re.sub(
-        r"if\s+t\.item\(\)\s*>=\s*boundary\s*:",
-        r"if _cmp_ge_boundary(t.item(), boundary):",
-        s
-    )
+    # safe if: if t.item() >= boundary:
+    s2 = re.sub(r'if\s+t\.item\(\)\s*>=\s*boundary\s*:', r'if _ge_boundary(t.item(), boundary):', s)
     if s2 != s: s = s2; changed = True
 
-    # 4) В начале generate(): локальная нормализация boundary
-    s2 = re.sub(
-        r"(?ms)^(\s*def\s+generate\s*\(.*?\):\s*\n)(\s*)(\S)",
-        lambda m: f"{m.group(1)}{m.group(2)}boundary = getattr(self, 'boundary', None)\n{m.group(2)}{m.group(3)}",
-        s
-    )
-    if s2 != s: s = s2; changed = True
+    # если вообще не найдено умножение — локально материализуем boundary в generate() или до первого цикла
+    if "boundary = _norm_boundary(self)" not in s:
+        s2 = re.sub(
+            r"(?ms)^(\s*def\s+generate\s*\(.*?\):\s*\n)(\s*)(\S)",
+            lambda m: f"{m.group(1)}{m.group(2)}boundary = _norm_boundary(self)\n{m.group(2)}{m.group(3)}",
+            s
+        )
+        if s2 != s:
+            s = s2; changed = True
+        else:
+            s2 = s.replace("for t in ", "boundary = _norm_boundary(self)\nfor t in ", 1)
+            if s2 != s:
+                s = s2; changed = True
 
     if changed:
         p.write_text(s, encoding="utf-8")
-        print("[patch] image2video.py: global safe boundary compare + local boundary init")
+        print("[patch] image2video.py: boundary normalized + safe compare (global)")
     else:
-        print("[patch] image2video.py: boundary globals already applied")
-PYPATCH_BOUNDARY_GLOBAL
-
-${PYBIN} - <<'PY'
-from pathlib import Path, re
-p = Path("/app/Wan2.2/wan/image2video.py")
-s = p.read_text(encoding="utf-8")
-
-pat = re.compile(r'^(?P<ind>\s*)boundary\s*=\s*self\.boundary\s*\*\s*self\.num_train_timesteps\s*$', re.M)
-def repl(m):
-    ind  = m.group('ind')
-    ind1 = ind + "    "
-    return (
-        f"{ind}_b = getattr(self,'boundary',None)\n"
-        f"{ind}_n = int(getattr(self,'num_train_timesteps',1000))\n"
-        f"{ind}if isinstance(_b, dict) or hasattr(_b,'get'):\n"
-        f"{ind1}boundary = None if not _b.get('enabled',False) else (\n"
-        f"{ind1}    int(max(0,min(1,float(_b.get('lower',0.0))))*_n),\n"
-        f"{ind1}    int(max(0,min(1,float(_b.get('upper',1.0))))*_n)\n"
-        f"{ind1})\n"
-        f"{ind}else:\n"
-        f"{ind1}try:\n"
-        f"{ind1}    boundary = int(float(_b)*_n)\n"
-        f"{ind1}except Exception:\n"
-        f"{ind1}    boundary = None"
-    )
-
-s2 = pat.sub(repl, s)
-if s2 != s:
-    p.write_text(s2, encoding="utf-8")
-    print("[patch] fixed boundary multiply -> normalized")
-else:
-    print("[patch] target multiply not found (maybe already patched)")
-PY
+        print("[patch] image2video.py: boundary already patched")
+PY_BOUNDARY
 
 # -----------------------------------------------------------------------------
 # Запуск хэндлера
