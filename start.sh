@@ -665,6 +665,95 @@ else:
 PY_ATTN_FALLBACK_FIX
 
 # -----------------------------------------------------------------------------
+# attention.py: SAFE SDPA WRAPPER — выровнять dtype/device и ручной fallback
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_ATTN_SAFE'
+from pathlib import Path
+import re
+p = Path("/app/Wan2.2/wan/modules/attention.py")
+if not p.exists():
+    print("[patch][warn] attention.py not found for safe SDPA wrapper")
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # Вставим helper один раз
+    if "def _wan_sdpa_safe(" not in s:
+        helper = r"""
+
+# === inserted: safe SDPA wrapper ===
+def _wan_sdpa_safe(q, k, v, dropout_p=0.0, is_causal=False):
+    import torch, torch.nn.functional as F
+    dev = q.device
+    # Выравниваем устройство
+    if k.device != dev: k = k.to(dev)
+    if v.device != dev: v = v.to(dev)
+    # Выравниваем тип: на CUDA -> fp16, иначе fp32
+    want = torch.float16 if dev.type == "cuda" else torch.float32
+    if q.dtype not in (torch.float16, torch.float32): q = q.to(want)
+    if k.dtype not in (torch.float16, torch.float32): k = k.to(want)
+    if v.dtype not in (torch.float16, torch.float32): v = v.to(want)
+    if dev.type == "cuda":
+        q = q.to(torch.float16); k = k.to(torch.float16); v = v.to(torch.float16)
+    else:
+        q = q.to(torch.float32); k = k.to(torch.float32); v = v.to(torch.float32)
+    # Континуальность
+    q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+    # Dropout в инференсе = 0
+    try:
+        if not torch.is_grad_enabled(): dropout_p = 0.0
+    except Exception:
+        dropout_p = 0.0
+    # Основной путь: SDPA
+    try:
+        return F.scaled_dot_product_attention(q, k, v, None, dropout_p, is_causal)
+    except Exception as e:
+        # Ручной бэкап: softmax(QK^T/sqrt(d)) V
+        try:
+            d = q.shape[-1]
+            scale = (1.0 / (d ** 0.5))
+            attn = (q @ k.transpose(-2, -1)) * scale
+            if is_causal:
+                mask = torch.triu(torch.ones_like(attn), diagonal=1)
+                attn = attn.masked_fill(mask.bool(), float("-inf"))
+            attn = attn.softmax(dim=-1)
+            return attn @ v
+        except Exception as e2:
+            raise RuntimeError(f"wan-sdpa failed: {e} ; fallback failed: {e2}")
+# === end inserted ===
+"""
+        # Вставим helper перед первой декларацией класса/функции
+        idx = s.find("class ")
+        if idx == -1:
+            idx = s.find("def ")
+        if idx != -1:
+            s = s[:idx] + helper + s[idx:]
+            changed = True
+
+    # Подменим место, где мы ранее ставили SDPA fallback (метка ##__SDPA_FALLBACK__)
+    pat = re.compile(r"(?m)^[ \t]*##__SDPA_FALLBACK__\s*\n[ \t]*if not FLASH_ATTN_2_AVAILABLE:[\s\S]*?return[^\n]*$")
+    def repl(m):
+        # Сохраняем отступ первой строки блока
+        first_line = m.group(0).splitlines()[0]
+        ind = first_line[:len(first_line)-len(first_line.lstrip())]
+        return (
+            f"{ind}##__SDPA_FALLBACK__\n"
+            f"{ind}if not FLASH_ATTN_2_AVAILABLE:\n"
+            f"{ind}    return _wan_sdpa_safe(q, k, v, dropout_p, is_causal)"
+        )
+    s2 = pat.sub(repl, s)
+    if s2 != s:
+        s = s2
+        changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] attention.py: safe SDPA wrapper installed")
+    else:
+        print("[patch] attention.py: already safe")
+PY_ATTN_SAFE
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
