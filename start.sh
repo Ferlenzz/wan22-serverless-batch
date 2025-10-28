@@ -13,12 +13,13 @@ export PYTHONPATH="/app:/app/Wan2.2:${PYTHONPATH:-}"
 # sitecustomize.py (тихий):
 #  - делает WanI2V вызываемым (__call__)
 #  - shim для generate: маппит prompt/img в именованные параметры
+#  - страховка: WAN_FORCE_BOUNDARY_OFF=1 мягко отключает boundary в рантайме
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_SITE'
 from pathlib import Path
 code = r'''
 # тишина: ничего не печатать из этого модуля
-import builtins, inspect
+import builtins, inspect, os
 
 def _patch_wani2v(mod):
     try:
@@ -57,6 +58,18 @@ def _patch_wani2v(mod):
             _shim._shimmed_kwmap = True
             cls.generate = _shim
 
+        # 3) страховка: по env принудительно гасим boundary
+        if os.environ.get("WAN_FORCE_BOUNDARY_OFF","0") == "1" and not getattr(cls, "_force_boundary_off", False):
+            _orig = cls.generate
+            def _wrap(self, *a, **k):
+                try:
+                    self.boundary = 0  # безопасный «не None» бэкстоп
+                except Exception:
+                    pass
+                return _orig(self, *a, **k)
+            cls.generate = _wrap
+            cls._force_boundary_off = True
+
     except Exception:
         pass
 
@@ -76,7 +89,7 @@ def _hook(name, globals=None, locals=None, fromlist=(), level=0):
 builtins.__import__ = _hook
 '''
 Path("/app/sitecustomize.py").write_text(code, encoding="utf-8")
-print("[start] wrote sitecustomize.py (quiet, __call__ + generate shim)")
+print("[start] wrote sitecustomize.py (quiet, __call__ + generate shim + boundary OFF hook)")
 PY_SITE
 
 # -----------------------------------------------------------------------------
@@ -339,7 +352,7 @@ def _ge_boundary(t_item, boundary):
     if pat_mult.search(s):
         s = pat_mult.sub("boundary = _norm_boundary(self)", s); changed = True
 
-    # safe ternary: sample_guide_scale = guide_scale[1] if t.item() >= boundary else guide_scale[0]
+    # safe ternary (в одну строку)
     pat_tern = re.compile(
         r'^\s*sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*if\s*t\.item\(\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\]\s*$',
         re.M
@@ -350,11 +363,11 @@ def _ge_boundary(t_item, boundary):
     s2 = pat_tern.sub(repl_tern, s)
     if s2 != s: s = s2; changed = True
 
-    # safe if: if t.item() >= boundary:
+    # safe if (в одну строку)
     s2 = re.sub(r'if\s+t\.item\(\)\s*>=\s*boundary\s*:', r'if _ge_boundary(t.item(), boundary):', s)
     if s2 != s: s = s2; changed = True
 
-    # если вообще не найдено умножение — локально материализуем boundary в generate() или до первого цикла
+    # если вообще не найдено умножение — локально материализуем boundary
     if "boundary = _norm_boundary(self)" not in s:
         s2 = re.sub(
             r"(?ms)^(\s*def\s+generate\s*\(.*?\):\s*\n)(\s*)(\S)",
@@ -376,6 +389,51 @@ def _ge_boundary(t_item, boundary):
 PY_BOUNDARY
 
 # -----------------------------------------------------------------------------
+# ДОП. патч: многострочные варианты сравнения/тернарника с boundary
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_BOUNDARY_MULTILINE'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/image2video.py")
+if not p.exists():
+    print("[patch][warn] not found:", p)
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # многострочный тернарник
+    pat_tern_ml = re.compile(
+        r'(?P<ind>^[ \t]*)sample_guide_scale\s*=\s*guide_scale\[\s*1\s*\]\s*'
+        r'if\s*t\.item\(\s*[\s\S]*?\)\s*>=\s*boundary\s*else\s*guide_scale\[\s*0\s*\][ \t]*$',
+        re.M
+    )
+    def repl_tern_ml(m):
+        ind = m.group('ind')
+        return (f"{ind}_cond = _ge_boundary(t.item(), boundary)\n"
+                f"{ind}sample_guide_scale = guide_scale[1] if _cond else guide_scale[0]")
+    s2 = pat_tern_ml.sub(repl_tern_ml, s)
+    if s2 != s:
+        s = s2; changed = True
+
+    # многострочный if
+    pat_if_ml = re.compile(
+        r'(?P<ind>^[ \t]*)if\s*t\.item\(\s*[\s\S]*?\)\s*>=\s*boundary\s*:[ \t]*$',
+        re.M
+    )
+    def repl_if_ml(m):
+        ind = m.group('ind')
+        return f"{ind}if _ge_boundary(t.item(), boundary):"
+    s2 = pat_if_ml.sub(repl_if_ml, s)
+    if s2 != s:
+        s = s2; changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: multiline boundary fixes applied")
+    else:
+        print("[patch] image2video.py: multiline patterns not found (maybe already patched)")
+PY_BOUNDARY_MULTILINE
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
@@ -390,13 +448,11 @@ else:
         return s[:len(s)-len(s.lstrip())]
 
     def indent_unit(sample_ws: str):
-        # если предыдущая строка отступлена табами — используем таб, иначе 4 пробела
         return '\t' if (sample_ws and sample_ws[0] == '\t') else ' ' * 4
 
     changed = False
     for i, line in enumerate(lines):
         if line.strip() == "boundary = _norm_boundary(self)":
-            # найдём ближайшую непустую предыдущую строку
             j = i - 1
             while j >= 0 and lines[j].strip() == "":
                 j -= 1
