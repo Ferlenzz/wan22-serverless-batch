@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 from inspect import signature, Parameter
 
-# --- ensure interpreter sees /app and /app/Wan2.2 ---
+# ensure interpreter sees /app and /app/Wan2.2
 for p in ("/app", "/app/Wan2.2"):
     if os.path.isdir(p) and p not in sys.path:
         sys.path.insert(0, p)
@@ -17,11 +17,11 @@ from PIL import Image
 import numpy as np
 import imageio
 
-# ------------------ Wan 2.2 ------------------
+# Wan 2.2
 from wan.configs.wan_ti2v_5B import ti2v_5B as cfg
 from wan.image2video import WanI2V
 
-# --- EasyDict compatibility ---
+#EasyDict compatibility
 try:
     from easydict import EasyDict as EDict
 except Exception:
@@ -29,7 +29,7 @@ except Exception:
         __getattr__ = dict.get
         __setattr__ = dict.__setitem__
 
-# ----- paths -----
+#paths
 RP_VOLUME   = Path(os.environ.get("RP_VOLUME", "/runpod-volume"))
 CKPT_DIR    = Path(os.environ.get("WAN_CKPT_DIR", RP_VOLUME / "models" / "Wan2.2-TI2V-5B"))
 RESULTS_DIR = RP_VOLUME / "results"
@@ -39,7 +39,7 @@ for d in (RESULTS_DIR, LAST_IMG_DIR):
 
 _MODEL: Optional[WanI2V] = None
 
-# ================= helpers =================
+#helpers
 def _ensure_cfg():
     """Take ti2v_5B config and normalize missing fields."""
     c = cfg() if callable(cfg) else cfg
@@ -96,9 +96,8 @@ def _arr_to_mp4_and_b64(arr: np.ndarray, out_path: Path, fps: int = 24) -> str:
     with open(out_path, "rb") as f:
         return "data:video/mp4;base64," + base64.b64encode(f.read()).decode()
 
-# ---- make WanI2V safely callable ----
+# WanI2V safely
 def _get_wan_call(obj):
-    # unwrap our proxy to the real WanI2V if needed
     try:
         from engine import _WanI2VProxy  # self-import safe if same module name
         if isinstance(obj, _WanI2VProxy):
@@ -108,7 +107,6 @@ def _get_wan_call(obj):
 
     call = getattr(obj, "__call__", None)
     if callable(call):
-        # prefer a real generate/infer if present; __call__ often hides signature
         for name in ("generate","infer","forward","run","predict","sample"):
             fn = getattr(obj, name, None)
             if callable(fn):
@@ -186,11 +184,9 @@ def _invoke_wan(obj, **kw):
     sig = signature(fn)
     params = list(sig.parameters.values())
 
-    # Подготовим кандидатов
     img_val = kw.get("img", kw.get("image"))
     prompt_val = kw.get("prompt", kw.get("input_prompt"))
 
-    # 1) Соберём позиционные аргументы (POSITIONAL_ONLY)
     args = []
     for p in params:
         if p.kind is Parameter.POSITIONAL_ONLY:
@@ -199,20 +195,15 @@ def _invoke_wan(obj, **kw):
             elif p.name in ("img", "image"):
                 args.append(img_val)
             else:
-                # другой позиционный — попытаемся взять из kw по имени
                 args.append(kw.get(p.name))
         elif p.kind in (Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY, Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD):
             break
 
-    # Проверка наличия обязательных позиционных без default
     need_pos = [p for p in params if p.kind is Parameter.POSITIONAL_ONLY and p.default is Parameter.empty]
     if any(a is None for a in args[:len(need_pos)]):
         raise TypeError("Required positional-only params are missing; make sure to pass image_base64 and (optionally) prompt.")
 
-    # 2) Именованные (keyword) — фильтруем и мапим
     kwargs = _filter_and_remap_kwargs(fn, kw)
-
-    # 3) СКВОЗНАЯ передача img/prompt — чтобы шины/обёртки увидели их даже без сигнатуры
     if img_val is not None:
         kwargs.setdefault("img", img_val)
         kwargs.setdefault("image", img_val)
@@ -226,7 +217,6 @@ def _invoke_wan(obj, **kw):
         import traceback as _tb
         print("[wan-debug] generation exception:", repr(e))
         try:
-            # Log key runtime knobs for quick triage
             _img = kwargs.get('img') or kwargs.get('image')
             _size = getattr(_img, 'size', None)
             _frame_num = kwargs.get('frame_num') or kwargs.get('length') or kwargs.get('frames')
@@ -245,7 +235,7 @@ class _WanI2VProxy:
 
 def _wrap_wani2v(obj): return _WanI2VProxy(obj)
 
-# ================ public API =================
+# public API
 def warmup() -> Dict[str, Any]:
     _ = _load_model()
     return {"ok": True, "message": "model initialized"}
