@@ -1067,6 +1067,73 @@ f"""{ind}# __CROSS_BATCH_ALIGN__: выровнять batch-ось Q vs K/V (in-f
 PY_CROSS_BATCH_ALIGN
 
 # -----------------------------------------------------------------------------
+# image2video.py: принудительно выровнять каналы sample к 4 * frame_num
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_LATENT_CHAN_SYNC'
+from pathlib import Path, re
+p = Path("/app/Wan2.2/wan/image2video.py")
+if not p.exists():
+    print("[patch][warn] image2video.py not found for latent-chan sync")
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # 1) Вставим helper один раз
+    if "_ensure_latent_channels(" not in s:
+        helper = r"""
+# --- inserted: ensure latent channels match 4*frame_num ---
+def _ensure_latent_channels(sample, frame_num:int):
+    import torch
+    want = int(frame_num) * 4
+    if not hasattr(sample, "shape"): 
+        return sample
+    if sample.dim() < 2: 
+        return sample
+    have = int(sample.shape[1])
+    if have == want:
+        return sample
+    # trim or pad with fresh noise on the same device/dtype/shape tail
+    B = int(sample.shape[0])
+    tail = sample.shape[2:]
+    if have > want:
+        return sample[:, :want, ...]
+    # pad
+    pad = torch.randn((B, want - have, *tail), device=sample.device, dtype=sample.dtype)
+    return torch.cat([sample, pad], dim=1)
+# --- end inserted ---
+"""
+        # Вставим перед первой декларацией класса/функции
+        idx = s.find("class ")
+        if idx == -1:
+            idx = s.find("def ")
+        if idx != -1:
+            s = s[:idx] + helper + s[idx:]
+            changed = True
+
+    # 2) Перед самым первым вызовом scheduler.step(...) гарантируем выравнивание
+    # Ищем первую строку "temp_x0 = sample_scheduler.step("
+    pat = re.compile(r"(?m)^(\s*)temp_x0\s*=\s*sample_scheduler\.step\(")
+    m = pat.search(s)
+    if m and "_ENSURE_LATENT_CHANS_APPLIED__" not in s:
+        ind = m.group(1)
+        inject = (
+            f"{ind}# __ENSURE_LATENT_CHANS_APPLIED__\n"
+            f"{ind}try:\n"
+            f"{ind}    sample = _ensure_latent_channels(sample, getattr(self, 'frame_num', 1))\n"
+            f"{ind}except Exception:\n"
+            f"{ind}    pass\n"
+        )
+        s = s[:m.start()] + inject + s[m.start():]
+        changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] image2video.py: latent channel sync before scheduler.step")
+    else:
+        print("[patch] image2video.py: latent chan sync already present or pattern not found")
+PY_LATENT_CHAN_SYNC
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
