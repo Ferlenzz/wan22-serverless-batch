@@ -849,6 +849,61 @@ def _wan_sdpa_merge(q, k, v, dropout_p=0.0, is_causal=False):
 PY_ATTN_RETURN_SHAPE
 
 # -----------------------------------------------------------------------------
+# attention.py: robust SDPA merge (поддержка 3D и 4D выходов)
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_ATTN_RETURN_SHAPE_V2'
+from pathlib import Path
+import re
+p = Path("/app/Wan2.2/wan/modules/attention.py")
+if not p.exists():
+    print("[patch][warn] attention.py not found for robust return-shape")
+else:
+    s = p.read_text(encoding="utf-8")
+    changed = False
+
+    # Переписываем тело _wan_sdpa_merge на робастное (3D/4D)
+    pat = re.compile(
+        r"(?ms)^def\s+_wan_sdpa_merge\s*\(\s*q\s*,\s*k\s*,\s*v\s*,\s*dropout_p\s*=\s*0\.0\s*,\s*is_causal\s*=\s*False\s*\)\s*:\s*.*?# === end inserted ==="
+    )
+    new_body = r"""def _wan_sdpa_merge(q, k, v, dropout_p=0.0, is_causal=False):
+    # Стремимся вернуть (B,T,C). Если SDPA дал (B,H,T,D) — сливаем головы.
+    out = _wan_sdpa_safe(q, k, v, dropout_p, False)  # non-causal
+    if out.dim() == 4:
+        B, H, T, D = out.shape
+        out = out.transpose(1, 2).contiguous().view(B, T, H * D)
+        return out
+    elif out.dim() == 3:
+        # Уже (B,T,C): отдаём как есть
+        return out
+    else:
+        raise RuntimeError(f"unexpected SDPA output rank: {out.dim()} with shape {tuple(out.shape)}")
+# === end inserted ==="""
+    s2 = pat.sub(new_body, s)
+    if s2 != s:
+        s = s2
+        changed = True
+    else:
+        # если сигнатура отличается — просто вставим/заменим определение функции
+        if "def _wan_sdpa_merge(" in s:
+            s = re.sub(r"(?ms)^def\s+_wan_sdpa_merge\(.*?\)\s*:\s*.*?$", new_body, s)
+            changed = True
+        else:
+            # не нашли — вставим helper перед первой декларацией класса/функции
+            idx = s.find("class ")
+            if idx == -1:
+                idx = s.find("def ")
+            if idx != -1:
+                s = s[:idx] + "\n\n" + new_body + "\n\n" + s[idx:]
+                changed = True
+
+    if changed:
+        p.write_text(s, encoding="utf-8")
+        print("[patch] attention.py: robust SDPA merge installed")
+    else:
+        print("[patch] attention.py: merge already robust")
+PY_ATTN_RETURN_SHAPE_V2
+
+# -----------------------------------------------------------------------------
 # re-indent: если boundary-вставка стоит сразу после `with …:` — добавить нужный отступ
 # -----------------------------------------------------------------------------
 ${PYBIN} - <<'PY_REINDENT'
